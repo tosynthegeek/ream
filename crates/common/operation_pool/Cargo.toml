@@ -19,5 +19,8 @@ ream-bls.workspace = true
 ream-consensus-beacon.workspace = true
 ream-consensus-misc.workspace = true
 
+[dev-dependencies]
+ssz_types.workspace = true
+
 [lints]
 workspace = true

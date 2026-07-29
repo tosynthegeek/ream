@@ -6856,6 +6856,7 @@ dependencies = [
  "ream-bls",
  "ream-consensus-beacon",
  "ream-consensus-misc",
+ "ssz_types",
  "tree_hash",
 ]
 

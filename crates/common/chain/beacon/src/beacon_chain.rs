@@ -232,6 +232,10 @@ impl BeaconChain {
     }
 
     fn process_block_attestations(&self, store: &mut Store, signed_block: &SignedBeaconBlock) {
+        store
+            .operation_pool
+            .mark_attestations_included(&signed_block.message.body.attestations);
+
         for attestation in signed_block.message.body.attestations.iter() {
             if let Err(err) = on_attestation(store, attestation.clone(), true) {
                 warn!("Failed to process block attestation through fork choice: {err:?}");

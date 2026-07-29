@@ -10,8 +10,9 @@ use ream_consensus_beacon::{
     voluntary_exit::SignedVoluntaryExit,
 };
 use ream_consensus_misc::{
-    constants::beacon::MIN_ATTESTATION_INCLUSION_DELAY, deposit::Deposit,
-    misc::compute_epoch_at_slot,
+    constants::beacon::MIN_ATTESTATION_INCLUSION_DELAY,
+    deposit::Deposit,
+    misc::{compute_epoch_at_slot, get_committee_indices},
 };
 use tree_hash::TreeHash;
 
@@ -24,7 +25,7 @@ pub struct ProposerPreparation {
     pub submission_epoch: u64,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct AttestationKey {
     slot: u64,
     attestation_data_root: B256,
@@ -45,6 +46,7 @@ pub struct OperationPool {
     attester_slashings: RwLock<HashSet<AttesterSlashing>>,
     proposer_slashings: RwLock<HashSet<ProposerSlashing>>,
     attestations: RwLock<HashMap<AttestationKey, Vec<Attestation>>>,
+    included_attestation_bits: RwLock<HashMap<AttestationKey, HashSet<usize>>>,
     sync_aggregates: RwLock<HashMap<SyncAggregateKey, SyncAggregate>>,
     deposits: RwLock<HashSet<Deposit>>,
 }
@@ -212,6 +214,7 @@ impl OperationPool {
         let current_epoch = state.get_current_epoch();
         let previous_epoch = state.get_previous_epoch();
         let attestations = self.attestations.read();
+        let included_attestation_bits = self.included_attestation_bits.read();
 
         let mut keys: Vec<&AttestationKey> = attestations
             .keys()
@@ -224,17 +227,54 @@ impl OperationPool {
         keys.sort_by_key(|key| std::cmp::Reverse(key.slot));
 
         keys.into_iter()
-            .filter_map(|key| aggregate_attestation_group(&attestations[key]))
+            .filter_map(|key| {
+                let already_included = included_attestation_bits
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_default();
+                aggregate_attestation_group(&attestations[key], &already_included)
+            })
             .take(MAX_ATTESTATIONS_ELECTRA)
             .collect()
     }
 
-    /// Keep only attestations from the current or previous epoch.
+    /// Record aggregation-bit positions from attestations that have been included in an
+    /// imported block so they are excluded from future packing.
+    pub fn mark_attestations_included(&self, attestations: &[Attestation]) {
+        let mut included_attestation_bits = self.included_attestation_bits.write();
+        for attestation in attestations {
+            let committee_indices = get_committee_indices(&attestation.committee_bits);
+            let [committee_index] = committee_indices.as_slice() else {
+                continue;
+            };
+
+            let key = AttestationKey {
+                slot: attestation.data.slot,
+                attestation_data_root: attestation.data.tree_hash_root(),
+                committee_index: *committee_index,
+            };
+
+            let set_bits = (0..attestation.aggregation_bits.len())
+                .filter(|&index| attestation.aggregation_bits.get(index).unwrap_or(false));
+
+            included_attestation_bits
+                .entry(key)
+                .or_default()
+                .extend(set_bits);
+        }
+    }
+
+    /// Keep only attestations (and their inclusion-tracking bits) from the current or previous
+    /// epoch.
     pub fn clean_attestations(&self, current_epoch: u64) {
-        self.attestations.write().retain(|key, _| {
+        let is_live = |key: &AttestationKey| {
             let target_epoch = compute_epoch_at_slot(key.slot);
             target_epoch + 1 >= current_epoch
-        });
+        };
+        self.attestations.write().retain(|key, _| is_live(key));
+        self.included_attestation_bits
+            .write()
+            .retain(|key, _| is_live(key));
     }
 
     pub fn get_sync_aggregate(&self, slot: u64, beacon_block_root: B256) -> Option<SyncAggregate> {
@@ -273,11 +313,16 @@ impl OperationPool {
     }
 }
 
-/// Aggregate non-overlapping votes from the same attestation group.
-fn aggregate_attestation_group(group: &[Attestation]) -> Option<Attestation> {
+/// Aggregate non-overlapping votes from the same attestation group, excluding any bit positions
+/// already present in `already_included` (votes that have already landed on-chain). Returns
+/// `None` if the group has nothing new to contribute beyond `already_included`.
+fn aggregate_attestation_group(
+    group: &[Attestation],
+    already_included: &HashSet<usize>,
+) -> Option<Attestation> {
     let mut aggregate = group.first()?.clone();
     let mut aggregation_bits = aggregate.aggregation_bits.clone();
-    let mut seen = HashSet::new();
+    let mut seen = already_included.clone();
     let mut signatures = Vec::new();
 
     for index in 0..aggregation_bits.len() {
@@ -321,7 +366,178 @@ fn aggregate_attestation_group(group: &[Attestation]) -> Option<Attestation> {
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::map::{DefaultHashBuilder, HashSet};
+    use ream_consensus_misc::{attestation_data::AttestationData, checkpoint::Checkpoint};
+    use ssz_types::{BitList, BitVector};
+
     use super::*;
+
+    /// Build an `Attestation` for committee `committee_index` at `slot`, with `set_bit_indices`
+    /// set within a `bitlist_len`-bit aggregation bitfield. `target_epoch` only needs to be
+    /// distinct per test scenario; it feeds into `attestation_data_root` via the rest of the
+    /// (otherwise-fixed) `AttestationData`, so distinct `target_epoch`/`slot` pairs produce
+    /// distinct `AttestationKey`s.
+    fn make_attestation(
+        slot: u64,
+        committee_index: u64,
+        target_epoch: u64,
+        bitlist_len: usize,
+        set_bit_indices: &[usize],
+    ) -> Attestation {
+        let mut aggregation_bits =
+            BitList::<ssz_types::typenum::U131072>::with_capacity(bitlist_len)
+                .expect("valid bitlist capacity");
+        for &index in set_bit_indices {
+            aggregation_bits
+                .set(index, true)
+                .expect("index within bitlist capacity");
+        }
+
+        let mut committee_bits = BitVector::<ssz_types::typenum::U64>::default();
+        committee_bits
+            .set(committee_index as usize, true)
+            .expect("committee index within bitvector capacity");
+
+        Attestation {
+            aggregation_bits,
+            data: AttestationData {
+                slot,
+                index: 0,
+                beacon_block_root: B256::repeat_byte(0xAB),
+                source: Checkpoint::default(),
+                target: Checkpoint {
+                    epoch: target_epoch,
+                    root: B256::repeat_byte(0xCD),
+                },
+            },
+            signature: BLSSignature::default(),
+            committee_bits,
+        }
+    }
+
+    #[test]
+    fn aggregate_attestation_group_excludes_already_included_bits() {
+        // Two validators (bits 0 and 1) attested for the same data; bit 0 already landed
+        // on-chain in an earlier block.
+        let attestation = make_attestation(10, 0, 1, 4, &[0, 1]);
+        let mut already_included = HashSet::with_hasher(DefaultHashBuilder::default());
+        already_included.insert(0);
+
+        let aggregate = aggregate_attestation_group(&[attestation], &already_included)
+            .expect("bit 1 is new and should still be aggregated");
+
+        assert!(!aggregate.aggregation_bits.get(0).unwrap());
+        assert!(aggregate.aggregation_bits.get(1).unwrap());
+    }
+
+    #[test]
+    fn aggregate_attestation_group_returns_none_when_fully_included() {
+        // Single attester (bit 0), and that bit has already landed on-chain: nothing new to
+        // offer, so the group should not consume a block-attestation slot.
+        let attestation = make_attestation(10, 0, 1, 4, &[0]);
+        let mut already_included = HashSet::with_hasher(DefaultHashBuilder::default());
+        already_included.insert(0);
+
+        assert!(aggregate_attestation_group(&[attestation], &already_included).is_none());
+    }
+
+    #[test]
+    fn aggregate_attestation_group_with_no_exclusions_matches_prior_behavior() {
+        let attestation = make_attestation(10, 0, 1, 4, &[0, 2]);
+
+        let aggregate = aggregate_attestation_group(
+            &[attestation],
+            &HashSet::with_hasher(DefaultHashBuilder::default()),
+        )
+        .expect("no exclusions, both bits should be aggregated");
+
+        assert!(aggregate.aggregation_bits.get(0).unwrap());
+        assert!(aggregate.aggregation_bits.get(2).unwrap());
+    }
+
+    #[test]
+    fn mark_attestations_included_records_bit_positions_per_key() {
+        let operation_pool = OperationPool::default();
+        let included_in_block = make_attestation(10, 3, 1, 4, &[1, 2]);
+
+        operation_pool.mark_attestations_included(std::slice::from_ref(&included_in_block));
+
+        let key = AttestationKey {
+            slot: included_in_block.data.slot,
+            attestation_data_root: included_in_block.data.tree_hash_root(),
+            committee_index: 3,
+        };
+        let recorded = operation_pool
+            .included_attestation_bits
+            .read()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(recorded, HashSet::from_iter([1, 2]));
+    }
+
+    #[test]
+    fn mark_attestations_included_ignores_multi_committee_attestations() {
+        // An attestation whose committee_bits spans more than one committee doesn't match the
+        // single-committee shape this pool ever produces itself; it should be left alone rather
+        // than mis-recorded under an arbitrary committee index.
+        let mut multi_committee = make_attestation(10, 0, 1, 4, &[0]);
+        multi_committee
+            .committee_bits
+            .set(1, true)
+            .expect("committee index within bitvector capacity");
+
+        let operation_pool = OperationPool::default();
+        operation_pool.mark_attestations_included(&[multi_committee]);
+
+        assert!(operation_pool.included_attestation_bits.read().is_empty());
+    }
+
+    #[test]
+    fn repeated_inclusion_of_same_bits_does_not_starve_new_votes() {
+        let operation_pool = OperationPool::default();
+        let key = AttestationKey {
+            slot: 10,
+            attestation_data_root: make_attestation(10, 0, 1, 4, &[]).data.tree_hash_root(),
+            committee_index: 0,
+        };
+
+        // First validator's vote lands on-chain.
+        let first_voter = make_attestation(10, 0, 1, 4, &[0]);
+        operation_pool.mark_attestations_included(std::slice::from_ref(&first_voter));
+
+        // A second validator's vote for the same attestation data arrives late and is still in
+        // the pool alongside a duplicate of the first (as would happen via gossip).
+        let second_voter = make_attestation(10, 0, 1, 4, &[1]);
+        let group = vec![first_voter, second_voter];
+
+        let already_included = operation_pool
+            .included_attestation_bits
+            .read()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let aggregate = aggregate_attestation_group(&group, &already_included)
+            .expect("second voter's bit is new and must still be selectable");
+
+        assert!(!aggregate.aggregation_bits.get(0).unwrap());
+        assert!(aggregate.aggregation_bits.get(1).unwrap());
+    }
+
+    #[test]
+    fn clean_attestations_also_prunes_included_bits_for_expired_keys() {
+        let operation_pool = OperationPool::default();
+        let old_attestation = make_attestation(0, 0, 0, 4, &[0]);
+        operation_pool.mark_attestations_included(std::slice::from_ref(&old_attestation));
+
+        assert!(!operation_pool.included_attestation_bits.read().is_empty());
+
+        // Far enough in the future that epoch 0's target is no longer current/previous.
+        operation_pool.clean_attestations(1_000);
+
+        assert!(operation_pool.included_attestation_bits.read().is_empty());
+    }
 
     #[test]
     fn test_proposer_preparation_operations() {
