@@ -5,7 +5,9 @@ use std::{
 };
 
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_misc::misc::compute_start_slot_at_epoch;
+use ream_consensus_misc::{
+    constants::beacon::NUM_CUSTODY_GROUPS, misc::compute_start_slot_at_epoch,
+};
 use ream_discv5::{
     config::DiscoveryConfig,
     subnet::{AttestationSubnets, CustodyGroupCount, SyncCommitteeSubnets},
@@ -128,7 +130,7 @@ impl NetworkManagerService {
         ))
         .build();
 
-        let custody_group_count = CustodyGroupCount::default();
+        let custody_group_count = CustodyGroupCount(NUM_CUSTODY_GROUPS);
         BEACON_CUSTODY_GROUPS.set(custody_group_count.0 as i64);
 
         let bootnodes = config
@@ -143,6 +145,9 @@ impl NetworkManagerService {
             disable_discovery: config.disable_discovery,
             attestation_subnets: AttestationSubnets::new(),
             sync_committee_subnets: SyncCommitteeSubnets::new(),
+            // Must match the count advertised in our MetaData: peers cross-check the ENR
+            // `cgc` against it and treat a mismatch, or a value below CUSTODY_REQUIREMENT,
+            // as a fault worth banning us for.
             custody_group_count,
         };
 
