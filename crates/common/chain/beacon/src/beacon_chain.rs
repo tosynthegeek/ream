@@ -13,6 +13,7 @@ use ream_consensus_misc::{
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::ExecutionEngine;
+use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
@@ -125,10 +126,12 @@ impl BeaconChain {
 
         self.process_block_attestations(&mut store, &signed_block);
         let block_event = self.build_block_event(&store, &signed_block);
+        let forkchoice_state = self.build_forkchoice_state(&store);
         drop(store);
 
         self.notify_block_imported(block_root);
         self.publish_block_event(block_event);
+        self.update_execution_forkchoice(forkchoice_state).await;
         Ok(BlockProcessingOutcome::Imported { block_root })
     }
 
@@ -141,11 +144,16 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         let imported_block =
             self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
+        let forkchoice_state = imported_block
+            .is_some()
+            .then(|| self.build_forkchoice_state(&store))
+            .flatten();
         drop(store);
 
         if let Some((imported_block_root, block_event)) = imported_block {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
+            self.update_execution_forkchoice(forkchoice_state).await;
         }
 
         Ok(())
@@ -173,11 +181,16 @@ impl BeaconChain {
             .insert(ColumnIdentifier::new(block_root, column_index), sidecar)?;
         let imported_block =
             self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
+        let forkchoice_state = imported_block
+            .is_some()
+            .then(|| self.build_forkchoice_state(&store))
+            .flatten();
         drop(store);
 
         if let Some((imported_block_root, block_event)) = imported_block {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
+            self.update_execution_forkchoice(forkchoice_state).await;
         }
 
         Ok(())
@@ -217,6 +230,65 @@ impl BeaconChain {
         self.process_block_attestations(store, &signed_block);
         let block_event = self.build_block_event(store, &signed_block);
         Ok((block_root, block_event))
+    }
+
+    /// The execution block hash a beacon block committed to, or zero when we cannot resolve it.
+    ///
+    /// Zero is what the engine API expects for "no such block", and is what genesis reports
+    /// before any payload exists.
+    fn execution_block_hash(store: &Store, block_root: B256) -> B256 {
+        store
+            .db
+            .block_provider()
+            .get(block_root)
+            .ok()
+            .flatten()
+            .map(|block| block.message.body.execution_payload.block_hash)
+            .unwrap_or_default()
+    }
+
+    /// Translate our fork choice view into the engine API's, so the execution layer can move
+    /// its own head. Returns `None` when there is no engine to tell.
+    fn build_forkchoice_state(&self, store: &Store) -> Option<ForkchoiceStateV1> {
+        self.execution_engine.as_ref()?;
+
+        let head_root = store
+            .get_head()
+            .inspect_err(|err| warn!("Failed to read head for forkchoice update: {err}"))
+            .ok()?;
+        let justified_root = store.db.justified_checkpoint_provider().get().ok()?.root;
+        let finalized_root = store.db.finalized_checkpoint_provider().get().ok()?.root;
+
+        Some(ForkchoiceStateV1 {
+            head_block_hash: Self::execution_block_hash(store, head_root),
+            safe_block_hash: Self::execution_block_hash(store, justified_root),
+            finalized_block_hash: Self::execution_block_hash(store, finalized_root),
+        })
+    }
+
+    /// Tell the execution engine which block is now canonical.
+    ///
+    /// `engine_newPayload` only hands a block over for validation; until a forkchoice update
+    /// arrives the execution layer keeps its old head, reports itself as syncing and serves
+    /// `eth_*` queries from a chain that never advances. Failing to notify is not a reason to
+    /// undo an import we have already accepted, so this only logs.
+    async fn update_execution_forkchoice(&self, forkchoice_state: Option<ForkchoiceStateV1>) {
+        let (Some(execution_engine), Some(forkchoice_state)) =
+            (self.execution_engine.as_ref(), forkchoice_state)
+        else {
+            return;
+        };
+
+        match execution_engine
+            .engine_forkchoice_updated_v3(forkchoice_state, None)
+            .await
+        {
+            Ok(result) => debug!(
+                "Forkchoice updated: execution engine reported {:?}",
+                result.payload_status.status
+            ),
+            Err(err) => warn!("Failed to update execution engine forkchoice: {err}"),
+        }
     }
 
     fn notify_block_imported(&self, block_root: B256) {
