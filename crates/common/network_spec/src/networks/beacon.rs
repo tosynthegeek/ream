@@ -12,7 +12,7 @@ use ream_consensus_misc::{
     fork_data::{ForkData, compute_fork_digest},
     misc::{checksummed_address, compute_epoch_at_slot},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::fork_schedule::ForkSchedule;
 
@@ -32,6 +32,15 @@ pub enum Network {
     Hoodi,
     Dev,
     Custom(String),
+}
+
+impl Serialize for Network {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 impl<'de> Deserialize<'de> for Network {
@@ -89,7 +98,7 @@ pub fn beacon_network_spec() -> Arc<BeaconNetworkSpec> {
         .clone()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub struct BeaconNetworkSpec {
     pub preset_base: String,

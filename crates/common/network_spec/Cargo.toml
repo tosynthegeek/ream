@@ -24,5 +24,8 @@ tracing.workspace = true
 # ream-dependencies
 ream-consensus-misc.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
