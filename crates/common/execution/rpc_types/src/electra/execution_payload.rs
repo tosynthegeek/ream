@@ -3,7 +3,6 @@ use alloy_consensus::{
     proofs::{ordered_trie_root, ordered_trie_root_with_encoder},
 };
 use alloy_primitives::{Address, B64, B256, Bloom, Bytes, U256, b256};
-use alloy_rlp::Encodable;
 use ream_consensus_misc::{misc::checksummed_address, withdrawal::Withdrawal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -146,11 +145,12 @@ fn compute_requests_hash(block_requests: &[Bytes]) -> B256 {
 
 /// Calculate the Merkle Patricia Trie root hash from a list of items
 /// `(rlp(index), encoded(item))` pairs.
-pub fn calculate_transactions_root<T>(transactions: &[T]) -> B256
-where
-    T: Encodable,
-{
-    ordered_trie_root_with_encoder(transactions, |tx: &T, buf| tx.encode(buf))
+///
+/// Payload transactions are already EIP-2718 envelopes, so they go into the trie exactly as
+/// they arrived. Running them through `Encodable` instead would wrap each one in a second RLP
+/// string header and silently produce a root no other client agrees with.
+pub fn calculate_transactions_root(transactions: &[Bytes]) -> B256 {
+    ordered_trie_root_with_encoder(transactions, |tx: &Bytes, buf| buf.extend_from_slice(tx))
 }
 
 /// Calculates the root hash of the withdrawals.
@@ -205,6 +205,28 @@ mod tests {
                 .hash_slow(),
             payload.block_hash,
         );
+    }
+
+    /// Block 1 is empty, so it exercises only the empty-trie root. Transactions reach the
+    /// trie as raw EIP-2718 envelopes; RLP-encoding them a second time yields a root that
+    /// looks perfectly valid locally and matches no other client.
+    #[test]
+    fn test_calculate_transactions_root_matches_a_real_block() {
+        let fixture = include_str!("../../resources/transactions_root_block.txt");
+        let mut lines = fixture
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty());
+
+        let expected_root: B256 = lines
+            .next()
+            .expect("fixture states the expected root first")
+            .parse()
+            .expect("expected root is hex");
+        let transactions = lines
+            .map(|line| line.parse::<Bytes>().expect("transaction is hex"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(calculate_transactions_root(&transactions), expected_root);
     }
 
     /// EIP-4399: the header's `mixHash` slot carries `prev_randao`.
