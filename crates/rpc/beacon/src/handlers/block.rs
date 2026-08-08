@@ -35,9 +35,11 @@ use ream_consensus_beacon::{
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
 use ream_consensus_misc::constants::beacon::{
-    WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
+    GENESIS_SLOT, WHISTLEBLOWER_REWARD_QUOTIENT, genesis_validators_root,
 };
+use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::p2p_sender::P2PSender;
+use ream_operation_pool::OperationPool;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
     gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
@@ -104,11 +106,16 @@ pub async fn get_block_root_from_id(block_id: ID, db: &BeaconDB) -> Result<B256,
 
             Ok(Some(justified_checkpoint.root))
         }
-        ID::Head | ID::Genesis => {
-            return Err(ApiError::NotFound(format!(
-                "This ID type is currently not supported: {block_id:?}"
-            )));
+        ID::Head => {
+            // `get_head` reads the fork choice entirely out of the database, so the pools it
+            // is constructed with are never consulted here.
+            let store = Store::new(db.clone(), Arc::new(OperationPool::default()), None);
+
+            Ok(Some(store.get_head().map_err(|err| {
+                ApiError::InternalError(format!("Failed to get head, error: {err:?}"))
+            })?))
         }
+        ID::Genesis => db.slot_index_provider().get(GENESIS_SLOT),
         ID::Slot(slot) => db.slot_index_provider().get(slot),
         ID::Root(root) => Ok(Some(root)),
     }
