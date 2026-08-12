@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::B256;
 use anyhow::{bail, ensure};
+use ream_chain_beacon::beacon_chain::is_data_availability_check_required;
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
     electra::beacon_block::SignedBeaconBlock,
@@ -150,7 +151,7 @@ impl BlockCache {
         self.block_ranges_to_retry.push(range);
     }
 
-    pub fn data_to_fetch(&mut self, finalized_slot: u64) -> DataToFetch {
+    pub fn data_to_fetch(&mut self, finalized_slot: u64, current_epoch: u64) -> DataToFetch {
         match self.block_ranges_to_retry.pop() {
             Some(range) => return DataToFetch::BlockRange(range),
             None => {
@@ -169,7 +170,7 @@ impl BlockCache {
         let missing_block_roots_len = block_roots_left_to_fetch.len();
         block_roots_left_to_fetch.retain(|root| !self.block_roots_in_progress.contains(root));
 
-        let mut blob_identifiers_left_to_fetch = self.get_missing_blob_identifiers();
+        let mut blob_identifiers_left_to_fetch = self.get_missing_blob_identifiers(current_epoch);
         let missing_blob_identifiers_len = blob_identifiers_left_to_fetch.len();
         blob_identifiers_left_to_fetch
             .retain(|blob_identifier| !self.blob_identifiers_in_progress.contains(blob_identifier));
@@ -219,11 +220,16 @@ impl BlockCache {
         missing_roots
     }
 
-    fn get_missing_blob_identifiers(&self) -> Vec<BlobIdentifier> {
-        let slot_17_days_ago = beacon_network_spec().slot_n_days_ago(17);
+    fn get_missing_blob_identifiers(&self, current_epoch: u64) -> Vec<BlobIdentifier> {
+        let network_spec = beacon_network_spec();
         let mut missing_roots = Vec::new();
         for block in self.blocks_and_blobs.values() {
-            if block.block.message.slot < slot_17_days_ago {
+            if !is_data_availability_check_required(
+                compute_epoch_at_slot(block.block.message.slot),
+                current_epoch,
+                network_spec.fulu_fork_epoch,
+                network_spec.min_epochs_for_data_column_sidecars_requests,
+            ) {
                 continue;
             }
 
@@ -278,6 +284,10 @@ impl std::fmt::Display for DataToFetch {
 
 #[cfg(test)]
 mod tests {
+    use ream_consensus_beacon::electra::beacon_block::BeaconBlock;
+    use ream_consensus_misc::{
+        misc::compute_start_slot_at_epoch, polynomial_commitments::kzg_commitment::KZGCommitment,
+    };
     use ream_network_spec::networks::beacon::initialize_test_network_spec;
 
     use super::*;
@@ -287,7 +297,7 @@ mod tests {
         initialize_test_network_spec();
         let mut cache = BlockCache::new(B256::ZERO, 10);
 
-        assert_eq!(cache.data_to_fetch(10), DataToFetch::Finished);
+        assert_eq!(cache.data_to_fetch(10, 0), DataToFetch::Finished);
     }
 
     #[test]
@@ -296,13 +306,63 @@ mod tests {
         let mut cache = BlockCache::new(B256::ZERO, 10);
 
         assert_eq!(
-            cache.data_to_fetch(25),
+            cache.data_to_fetch(25, 0),
             DataToFetch::BlockRange(Range::new(11, 10))
         );
         assert_eq!(
-            cache.data_to_fetch(25),
+            cache.data_to_fetch(25, 0),
             DataToFetch::BlockRange(Range::new(21, 5))
         );
-        assert_eq!(cache.data_to_fetch(25), DataToFetch::Finished);
+        assert_eq!(cache.data_to_fetch(25, 0), DataToFetch::Finished);
+    }
+
+    #[test]
+    fn blob_fetching_uses_the_data_availability_retention_boundary() {
+        initialize_test_network_spec();
+        let network_spec = beacon_network_spec();
+        let current_epoch = network_spec.fulu_fork_epoch
+            + network_spec.min_epochs_for_data_column_sidecars_requests
+            + 10;
+        let boundary_epoch =
+            current_epoch - network_spec.min_epochs_for_data_column_sidecars_requests;
+        let parent_root = B256::repeat_byte(1);
+
+        let block_with_blob = |slot| {
+            let mut block = SignedBeaconBlock {
+                message: BeaconBlock {
+                    slot,
+                    parent_root,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            };
+            block
+                .message
+                .body
+                .blob_kzg_commitments
+                .push(KZGCommitment::empty_for_testing())
+                .expect("one commitment should fit");
+            block
+        };
+
+        let boundary_slot = compute_start_slot_at_epoch(boundary_epoch);
+        let mut retained = BlockCache::new(parent_root, boundary_slot);
+        retained
+            .add_blocks(vec![block_with_blob(boundary_slot)], false)
+            .expect("boundary block should enter cache");
+        assert!(matches!(
+            retained.data_to_fetch(boundary_slot, current_epoch),
+            DataToFetch::MissingBlobIdentifiers(identifiers) if identifiers.len() == 1
+        ));
+
+        let expired_slot = compute_start_slot_at_epoch(boundary_epoch - 1);
+        let mut expired = BlockCache::new(parent_root, expired_slot);
+        expired
+            .add_blocks(vec![block_with_blob(expired_slot)], false)
+            .expect("expired block should enter cache");
+        assert_eq!(
+            expired.data_to_fetch(expired_slot, current_epoch),
+            DataToFetch::Finished
+        );
     }
 }

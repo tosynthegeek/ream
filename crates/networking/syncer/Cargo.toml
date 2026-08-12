@@ -33,8 +33,13 @@ ream-consensus-misc.workspace = true
 ream-executor.workspace = true
 ream-network-spec.workspace = true
 ream-p2p.workspace = true
+ream-polynomial-commitments.workspace = true
 ream-req-resp.workspace = true
 ream-storage.workspace = true
+
+[dev-dependencies]
+kzg.workspace = true
+ream-execution-rpc-types.workspace = true
 
 [lints]
 workspace = true

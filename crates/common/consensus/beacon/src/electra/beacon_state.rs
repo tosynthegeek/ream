@@ -2478,7 +2478,10 @@ impl BeaconState {
             .ok_or(anyhow!("Invalid block proposer index"))?;
         let signing_root = compute_signing_root(
             signed_block.message.clone(),
-            self.get_domain(DOMAIN_BEACON_PROPOSER, None),
+            self.get_domain(
+                DOMAIN_BEACON_PROPOSER,
+                Some(compute_epoch_at_slot(signed_block.message.slot)),
+            ),
         );
 
         signed_block
