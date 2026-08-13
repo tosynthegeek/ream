@@ -313,9 +313,8 @@ impl OperationPool {
     }
 }
 
-/// Aggregate non-overlapping votes from the same attestation group, excluding any bit positions
-/// already present in `already_included` (votes that have already landed on-chain). Returns
-/// `None` if the group has nothing new to contribute beyond `already_included`.
+/// Aggregates non-overlapping votes, excluding bits already present in `already_included`.
+/// Returns `None` if no new votes remain.
 fn aggregate_attestation_group(
     group: &[Attestation],
     already_included: &HashSet<usize>,
