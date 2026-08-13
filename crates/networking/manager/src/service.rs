@@ -12,6 +12,7 @@ use ream_discv5::{
 };
 use ream_executor::ReamExecutor;
 use ream_fork_choice_beacon::data_availability::AvailabilityEntryStatus;
+use ream_metrics::BEACON_CUSTODY_GROUPS;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
     config::NetworkConfig,
@@ -127,6 +128,9 @@ impl NetworkManagerService {
         ))
         .build();
 
+        let custody_group_count = CustodyGroupCount::default();
+        BEACON_CUSTODY_GROUPS.set(custody_group_count.0 as i64);
+
         let bootnodes = config
             .bootnodes
             .to_enrs_beacon(beacon_network_spec().network.clone());
@@ -139,7 +143,7 @@ impl NetworkManagerService {
             disable_discovery: config.disable_discovery,
             attestation_subnets: AttestationSubnets::new(),
             sync_committee_subnets: SyncCommitteeSubnets::new(),
-            custody_group_count: CustodyGroupCount::default(),
+            custody_group_count,
         };
 
         let gossipsub_config = init_gossipsub_config_with_topics(config.gossipsub_history_length);

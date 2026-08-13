@@ -11,6 +11,7 @@ use ream_consensus_misc::{
 };
 use ream_data_availability::PendingBlock;
 use ream_execution_engine::engine_trait::ExecutionApi;
+use ream_metrics::BEACON_PROCESSED_DEPOSITS_TOTAL;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_storage::{
     errors::StoreError,
@@ -122,6 +123,8 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     let block_slot = signed_block.message.slot;
     let state: BeaconState = pending.post_state;
 
+    BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
+
     // Add new block to the store
     store.db.block_provider().insert(block_root, signed_block)?;
 
@@ -154,6 +157,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     store.update_checkpoints(
         state.current_justified_checkpoint,
         state.finalized_checkpoint,
+        state.previous_justified_checkpoint,
     )?;
 
     // Eagerly compute unrealized justification and finality.

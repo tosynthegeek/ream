@@ -39,6 +39,7 @@ ream-consensus-misc.workspace = true
 ream-data-availability.workspace = true
 ream-execution-engine.workspace = true
 ream-execution-rpc-types.workspace = true
+ream-metrics.workspace = true
 ream-network-spec.workspace = true
 ream-operation-pool.workspace = true
 ream-storage.workspace = true
