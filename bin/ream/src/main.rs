@@ -911,13 +911,18 @@ pub async fn run_voluntary_exit(config: VoluntaryExitConfig) {
 
 /// Calculates the current epoch from genesis time
 fn get_current_epoch(genesis_time: u64) -> u64 {
-    compute_epoch_at_slot(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH + Duration::from_secs(genesis_time))
-            .expect("System Time is before the genesis time")
-            .as_secs()
-            / beacon_network_spec().seconds_per_slot(),
+    epoch_at_time(
+        SystemTime::now(),
+        genesis_time,
+        beacon_network_spec().seconds_per_slot(),
     )
+}
+
+fn epoch_at_time(now: SystemTime, genesis_time: u64, seconds_per_slot: u64) -> u64 {
+    let elapsed = now
+        .duration_since(UNIX_EPOCH + Duration::from_secs(genesis_time))
+        .unwrap_or_default();
+    compute_epoch_at_slot(elapsed.as_secs() / seconds_per_slot)
 }
 
 /// Generates a new secp256k1 keypair and saves it to the specified path in hex encoding.
@@ -1097,6 +1102,14 @@ mod tests {
     // proofs before the relay reports the gossip message as accepted.
     const BEACON_E2E_GOSSIPSUB_HISTORY_LENGTH: usize = 64;
     const BEACON_E2E_KEYSTORE_PASSWORD: &str = "password";
+
+    #[test]
+    fn voluntary_exit_epoch_is_zero_before_genesis() {
+        let genesis_time = 200;
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+
+        assert_eq!(crate::epoch_at_time(now, genesis_time, 12), 0);
+    }
 
     // Production's `BEACON_NETWORK_SPEC`/`GENESIS_VALIDATORS_ROOT` OnceLocks only allow one set
     // per process. Every beacon e2e test below therefore uses this shared dev spec + genesis.

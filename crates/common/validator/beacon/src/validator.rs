@@ -122,9 +122,7 @@ impl ValidatorService {
 
         let genesis_instant =
             UNIX_EPOCH + Duration::from_secs(beacon_network_spec().min_genesis_time);
-        let elapsed = SystemTime::now()
-            .duration_since(genesis_instant)
-            .expect("System Time is before the genesis time");
+        let elapsed = elapsed_since_genesis(SystemTime::now(), genesis_instant);
 
         let mut intervals = elapsed.as_secs() / seconds_per_interval;
         let mut slot = intervals / INTERVALS_PER_SLOT;
@@ -628,6 +626,12 @@ impl ValidatorService {
     }
 }
 
+fn elapsed_since_genesis(now: SystemTime, genesis_instant: SystemTime) -> Duration {
+    now.duration_since(genesis_instant)
+        // Pre-genesis starts at slot zero instead of aborting the validator.
+        .unwrap_or_default()
+}
+
 async fn make_attestation_for_duty(
     beacon_api_client: Arc<BeaconApiClient>,
     keystore: Arc<Keystore>,
@@ -653,4 +657,18 @@ async fn make_attestation_for_duty(
             data: attestation_data,
         }])
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elapsed_since_genesis_clamps_to_zero_before_genesis() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let genesis = UNIX_EPOCH + Duration::from_secs(160);
+
+        assert_eq!(elapsed_since_genesis(now, genesis), Duration::ZERO);
+        assert_eq!(elapsed_since_genesis(genesis, genesis), Duration::ZERO);
+    }
 }
