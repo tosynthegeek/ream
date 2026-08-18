@@ -220,6 +220,75 @@ lazy_static::lazy_static! {
     pub static ref BEACON_PARTIAL_MESSAGE_COLUMN_COMPLETIONS_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
         "beacon_partial_message_column_completions_total", "Times a partial message first completed a column", &["column_index"], default_registry()
     ).expect("failed to create BEACON_PARTIAL_MESSAGE_COLUMN_COMPLETIONS_TOTAL int counter vec");
+
+    pub static ref BEACON_STORE_LOCK_WAIT_SECONDS: Histogram = {
+        let opts = HistogramOpts::new(
+            "beacon_store_lock_wait_seconds",
+            "Time spent waiting to acquire the shared Store lock"
+        ).buckets(vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_STORE_LOCK_WAIT_SECONDS")
+    };
+
+    pub static ref BEACON_BLOCK_PROCESSING_SECONDS: Histogram = {
+        let opts = HistogramOpts::new(
+            "beacon_block_processing_seconds",
+            "Full runtime of process_block, lock acquisition through commit"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_BLOCK_PROCESSING_SECONDS")
+    };
+
+    pub static ref BEACON_BLOCK_STATE_TRANSITION_SECONDS: Histogram = {
+        let opts = HistogramOpts::new(
+            "beacon_block_state_transition_seconds",
+            "Time spent in state_transition (process_slots + process_block), excluding lock wait"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_BLOCK_STATE_TRANSITION_SECONDS")
+    };
+
+    pub static ref BEACON_BLOCK_STATE_ROOT_SECONDS: Histogram = {
+        // Full SSZ hash_tree_root of the post-state, checked against block.state_root.
+        let opts = HistogramOpts::new(
+            "beacon_block_state_root_seconds",
+            "Time spent computing/verifying the post-state hash tree root"
+        ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_BLOCK_STATE_ROOT_SECONDS")
+    };
+
+    pub static ref BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS: Histogram = {
+        // Round trip to the EL for engine_newPayload — same bucket range as the
+        // existing getBlobsV2/V3 request histograms for consistency.
+        let opts = HistogramOpts::new(
+            "beacon_engine_new_payload_request_duration_seconds",
+            "Duration of verify_and_notify_new_payload (engine_newPayload) requests"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS")
+    };
+
+    pub static ref BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS: Histogram = {
+        let opts = HistogramOpts::new(
+            "beacon_execution_forkchoice_update_seconds",
+            "Duration of update_execution_forkchoice (engine_forkchoiceUpdated) calls"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS")
+    };
 }
 
 /// Zero-initializes gauges so dashboards show `0` instead of "no data" before the

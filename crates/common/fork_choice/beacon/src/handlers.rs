@@ -11,7 +11,7 @@ use ream_consensus_misc::{
 };
 use ream_data_availability::PendingBlock;
 use ream_execution_engine::engine_trait::ExecutionApi;
-use ream_metrics::BEACON_PROCESSED_DEPOSITS_TOTAL;
+use ream_metrics::{BEACON_BLOCK_STATE_TRANSITION_SECONDS, BEACON_PROCESSED_DEPOSITS_TOTAL};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_storage::{
     errors::StoreError,
@@ -79,9 +79,11 @@ pub async fn on_block(
         .get(parent_root)?
         .ok_or_else(|| anyhow!("beacon state not found"))?
         .clone();
+    let state_transition_timer = BEACON_BLOCK_STATE_TRANSITION_SECONDS.start_timer();
     state
         .state_transition(signed_block, true, execution_engine)
         .await?;
+    state_transition_timer.observe_duration();
 
     let pending = PendingBlock {
         signed_block: signed_block.clone(),

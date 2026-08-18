@@ -69,6 +69,9 @@ use ream_execution_rpc_types::electra::{
     execution_payload::ExecutionPayload, execution_payload_header::ExecutionPayloadHeader,
 };
 use ream_merkle::{generate_proof, is_valid_merkle_branch, merkle_tree};
+use ream_metrics::{
+    BEACON_BLOCK_STATE_ROOT_SECONDS, BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ssz_derive::{Decode, Encode};
@@ -2722,16 +2725,18 @@ impl BeaconState {
         }
 
         if let Some(execution_engine) = execution_engine {
-            ensure!(
-                execution_engine
-                    .verify_and_notify_new_payload(NewPayloadRequest {
-                        execution_payload: payload.clone(),
-                        versioned_hashes,
-                        parent_beacon_block_root: self.latest_block_header.parent_root,
-                        execution_requests: body.execution_requests.clone()
-                    })
-                    .await?
-            );
+            let new_payload_timer =
+                BEACON_ENGINE_NEW_PAYLOAD_REQUEST_DURATION_SECONDS.start_timer();
+            let new_payload_result = execution_engine
+                .verify_and_notify_new_payload(NewPayloadRequest {
+                    execution_payload: payload.clone(),
+                    versioned_hashes,
+                    parent_beacon_block_root: self.latest_block_header.parent_root,
+                    execution_requests: body.execution_requests.clone(),
+                })
+                .await;
+            new_payload_timer.observe_duration();
+            ensure!(new_payload_result?);
         }
 
         // Cache execution payload header
@@ -2765,17 +2770,14 @@ impl BeaconState {
     ) -> anyhow::Result<()> {
         let block = &signed_block.message;
         // Process slots (including those with no blocks) since block
-        self.process_slots(block.slot)?;
-
-        // Verify signature
-        if validate_result {
-            ensure!(self.verify_block_header_signature(&signed_block.signed_header())?)
-        }
-        // Process block
         self.process_block(block, execution_engine).await?;
+
         // Verify state root
         if validate_result {
-            ensure!(block.state_root == self.tree_hash_root())
+            let state_root_timer = BEACON_BLOCK_STATE_ROOT_SECONDS.start_timer();
+            let computed_state_root = self.tree_hash_root();
+            state_root_timer.observe_duration();
+            ensure!(block.state_root == computed_state_root)
         }
         Ok(())
     }

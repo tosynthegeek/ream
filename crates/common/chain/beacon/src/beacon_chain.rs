@@ -22,6 +22,10 @@ use ream_fork_choice_beacon::{
     },
     store::Store,
 };
+use ream_metrics::{
+    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS,
+    BEACON_STORE_LOCK_WAIT_SECONDS,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
 use ream_req_resp::beacon::messages::status::Status;
@@ -99,7 +103,12 @@ impl BeaconChain {
         signed_block: SignedBeaconBlock,
     ) -> anyhow::Result<BlockProcessingOutcome> {
         let block_root = signed_block.message.tree_hash_root();
+        let block_processing_timer = BEACON_BLOCK_PROCESSING_SECONDS.start_timer();
+
+        let lock_wait_timer = BEACON_STORE_LOCK_WAIT_SECONDS.start_timer();
         let mut store = self.store.lock().await;
+        lock_wait_timer.observe_duration();
+
         let network_spec = beacon_network_spec();
         let verify_data_availability = self.force_data_availability_checks
             || is_data_availability_check_required(
@@ -131,7 +140,12 @@ impl BeaconChain {
 
         self.notify_block_imported(block_root);
         self.publish_block_event(block_event);
+
+        let forkchoice_update_timer = BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS.start_timer();
         self.update_execution_forkchoice(forkchoice_state).await;
+        forkchoice_update_timer.observe_duration();
+
+        block_processing_timer.observe_duration();
         Ok(BlockProcessingOutcome::Imported { block_root })
     }
 
