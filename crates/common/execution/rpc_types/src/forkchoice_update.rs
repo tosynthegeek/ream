@@ -5,7 +5,7 @@ use ssz_types::{VariableList, typenum::U16};
 
 use super::payload_status::PayloadStatusV1;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkchoiceStateV1 {
     pub head_block_hash: B256,

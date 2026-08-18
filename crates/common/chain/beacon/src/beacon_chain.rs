@@ -62,6 +62,7 @@ pub struct BeaconChain {
     pub execution_engine: Option<ExecutionEngine>,
     pub event_sender: Option<broadcast::Sender<BeaconEvent>>,
     block_import_sender: broadcast::Sender<BlockImportEvent>,
+    execution_forkchoice: Mutex<Option<ForkchoiceStateV1>>,
     force_data_availability_checks: bool,
 }
 
@@ -81,6 +82,7 @@ impl BeaconChain {
             execution_engine,
             event_sender,
             block_import_sender,
+            execution_forkchoice: Mutex::new(None),
             force_data_availability_checks: false,
         }
     }
@@ -135,14 +137,13 @@ impl BeaconChain {
 
         self.process_block_attestations(&mut store, &signed_block);
         let block_event = self.build_block_event(&store, &signed_block);
-        let forkchoice_state = self.build_forkchoice_state(&store);
         drop(store);
 
         self.notify_block_imported(block_root);
         self.publish_block_event(block_event);
 
         let forkchoice_update_timer = BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS.start_timer();
-        self.update_execution_forkchoice(forkchoice_state).await;
+        self.update_execution_forkchoice(true).await;
         forkchoice_update_timer.observe_duration();
 
         block_processing_timer.observe_duration();
@@ -158,16 +159,12 @@ impl BeaconChain {
         let mut store = self.store.lock().await;
         let imported_block =
             self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
-        let forkchoice_state = imported_block
-            .is_some()
-            .then(|| self.build_forkchoice_state(&store))
-            .flatten();
         drop(store);
 
         if let Some((imported_block_root, block_event)) = imported_block {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
-            self.update_execution_forkchoice(forkchoice_state).await;
+            self.update_execution_forkchoice(true).await;
         }
 
         Ok(())
@@ -195,16 +192,12 @@ impl BeaconChain {
             .insert(ColumnIdentifier::new(block_root, column_index), sidecar)?;
         let imported_block =
             self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
-        let forkchoice_state = imported_block
-            .is_some()
-            .then(|| self.build_forkchoice_state(&store))
-            .flatten();
         drop(store);
 
         if let Some((imported_block_root, block_event)) = imported_block {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
-            self.update_execution_forkchoice(forkchoice_state).await;
+            self.update_execution_forkchoice(true).await;
         }
 
         Ok(())
@@ -246,10 +239,7 @@ impl BeaconChain {
         Ok((block_root, block_event))
     }
 
-    /// The execution block hash a beacon block committed to, or zero when we cannot resolve it.
-    ///
-    /// Zero is what the engine API expects for "no such block", and is what genesis reports
-    /// before any payload exists.
+    /// Returns zero when the beacon block has no known execution payload.
     fn execution_block_hash(store: &Store, block_root: B256) -> B256 {
         store
             .db
@@ -261,8 +251,7 @@ impl BeaconChain {
             .unwrap_or_default()
     }
 
-    /// Translate our fork choice view into the engine API's, so the execution layer can move
-    /// its own head. Returns `None` when there is no engine to tell.
+    /// Translates consensus fork choice into Engine API block hashes.
     fn build_forkchoice_state(&self, store: &Store) -> Option<ForkchoiceStateV1> {
         self.execution_engine.as_ref()?;
 
@@ -280,27 +269,39 @@ impl BeaconChain {
         })
     }
 
-    /// Tell the execution engine which block is now canonical.
-    ///
-    /// `engine_newPayload` only hands a block over for validation; until a forkchoice update
-    /// arrives the execution layer keeps its old head, reports itself as syncing and serves
-    /// `eth_*` queries from a chain that never advances. Failing to notify is not a reason to
-    /// undo an import we have already accepted, so this only logs.
-    async fn update_execution_forkchoice(&self, forkchoice_state: Option<ForkchoiceStateV1>) {
-        let (Some(execution_engine), Some(forkchoice_state)) =
-            (self.execution_engine.as_ref(), forkchoice_state)
-        else {
+    /// Updates the execution head without rolling back an accepted consensus import on failure.
+    async fn update_execution_forkchoice(&self, allow_initial_update: bool) {
+        let Some(execution_engine) = self.execution_engine.as_ref() else {
             return;
         };
+
+        // Recompute after serialization so a delayed import cannot send stale state last.
+        let mut last_forkchoice = self.execution_forkchoice.lock().await;
+        if last_forkchoice.is_none() && !allow_initial_update {
+            return;
+        }
+        let forkchoice_state = {
+            let store = self.store.lock().await;
+            self.build_forkchoice_state(&store)
+        };
+        let Some(forkchoice_state) = forkchoice_state else {
+            return;
+        };
+        if last_forkchoice.as_ref() == Some(&forkchoice_state) {
+            return;
+        }
 
         match execution_engine
             .engine_forkchoice_updated_v3(forkchoice_state, None)
             .await
         {
-            Ok(result) => debug!(
-                "Forkchoice updated: execution engine reported {:?}",
-                result.payload_status.status
-            ),
+            Ok(result) => {
+                *last_forkchoice = Some(forkchoice_state);
+                debug!(
+                    "Forkchoice updated: execution engine reported {:?}",
+                    result.payload_status.status
+                );
+            }
             Err(err) => warn!("Failed to update execution engine forkchoice: {err}"),
         }
     }
@@ -359,6 +360,8 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attester_slashing(&mut store, attester_slashing)?;
+        drop(store);
+        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
@@ -369,12 +372,16 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attestation(&mut store, attestation, is_from_block)?;
+        drop(store);
+        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
     pub async fn process_tick(&self, time: u64) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_tick(&mut store, time)?;
+        drop(store);
+        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
