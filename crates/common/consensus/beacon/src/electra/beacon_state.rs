@@ -2770,6 +2770,13 @@ impl BeaconState {
     ) -> anyhow::Result<()> {
         let block = &signed_block.message;
         // Process slots (including those with no blocks) since block
+        self.process_slots(block.slot)?;
+
+        // Verify block signature
+        if validate_result {
+            ensure!(self.verify_block_header_signature(&signed_block.signed_header())?)
+        }
+
         self.process_block(block, execution_engine).await?;
 
         // Verify state root
@@ -2779,6 +2786,7 @@ impl BeaconState {
             state_root_timer.observe_duration();
             ensure!(block.state_root == computed_state_root)
         }
+
         Ok(())
     }
 
