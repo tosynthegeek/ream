@@ -40,7 +40,19 @@ fn build_spec(network_spec: &BeaconNetworkSpec) -> Result<Value, ApiError> {
         ));
     };
 
+    // Expose the standard Beacon API name and unit.
+    entries.remove("SLOT_DURATION_MS");
+    entries.insert(
+        "TERMINAL_TOTAL_DIFFICULTY".into(),
+        Value::String(network_spec.terminal_total_difficulty.to_string()),
+    );
+    entries.insert(
+        "DEPOSIT_NETWORK_ID".into(),
+        json!(network_spec.deposit_network_id),
+    );
+
     for (key, value) in [
+        ("SECONDS_PER_SLOT", json!(network_spec.seconds_per_slot())),
         ("SLOTS_PER_EPOCH", json!(SLOTS_PER_EPOCH)),
         ("MAX_COMMITTEES_PER_SLOT", json!(MAX_COMMITTEES_PER_SLOT)),
         (
@@ -51,7 +63,6 @@ fn build_spec(network_spec: &BeaconNetworkSpec) -> Result<Value, ApiError> {
             "DOMAIN_AGGREGATE_AND_PROOF",
             json!(DOMAIN_AGGREGATE_AND_PROOF),
         ),
-        ("DEPOSIT_NETWORK_ID", json!(network_spec.deposit_chain_id)),
         // Not a fork we implement. Reporting it as far future is how a client says
         // "not scheduled", and leaving it out instead reads as a disagreement.
         ("GLOAS_FORK_EPOCH", json!(FAR_FUTURE_EPOCH)),
@@ -59,15 +70,21 @@ fn build_spec(network_spec: &BeaconNetworkSpec) -> Result<Value, ApiError> {
         entries.entry(key).or_insert(value);
     }
 
-    // The Beacon API quotes every integer, so that a JSON parser without 64-bit integers
-    // cannot silently round one.
-    for value in entries.values_mut() {
-        if let Some(number) = value.as_u64() {
-            *value = Value::String(number.to_string());
-        }
-    }
+    // Match the quoted integers returned by other clients, including nested values.
+    quote_integers(&mut spec);
 
     Ok(spec)
+}
+
+fn quote_integers(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(quote_integers),
+        Value::Object(entries) => entries.values_mut().for_each(quote_integers),
+        Value::Number(number) if number.is_i64() || number.is_u64() => {
+            *value = Value::String(number.to_string());
+        }
+        _ => {}
+    }
 }
 
 /// Called by `config/spec` to get specification configuration.
@@ -92,4 +109,36 @@ pub async fn get_config_deposit_contract() -> Result<impl Responder, ApiError> {
 #[get("config/fork_schedule")]
 pub async fn get_fork_schedule() -> Result<impl Responder, ApiError> {
     Ok(HttpResponse::Ok().json(DataResponse::new(beacon_network_spec().fork_schedule())))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::U256;
+    use ream_consensus_misc::blob_parameters::BlobParameters;
+    use ream_network_spec::networks::DEV;
+
+    use super::*;
+
+    #[test]
+    fn build_spec_uses_beacon_api_names_and_quotes_nested_integers() {
+        let mut network_spec = DEV.as_ref().clone();
+        network_spec.terminal_total_difficulty =
+            U256::from_str_radix("58750000000000000000000", 10).expect("valid TTD");
+        network_spec.deposit_chain_id = 1;
+        network_spec.deposit_network_id = 2;
+        network_spec.blob_schedule = vec![BlobParameters {
+            epoch: 9,
+            max_blobs_per_block: 12,
+        }];
+
+        let spec = build_spec(&network_spec).expect("builds spec");
+
+        assert!(spec.get("SLOT_DURATION_MS").is_none());
+        assert_eq!(spec["SECONDS_PER_SLOT"], "12");
+        assert_eq!(spec["TERMINAL_TOTAL_DIFFICULTY"], "58750000000000000000000");
+        assert_eq!(spec["DEPOSIT_CHAIN_ID"], "1");
+        assert_eq!(spec["DEPOSIT_NETWORK_ID"], "2");
+        assert_eq!(spec["BLOB_SCHEDULE"][0]["EPOCH"], "9");
+        assert_eq!(spec["BLOB_SCHEDULE"][0]["MAX_BLOBS_PER_BLOCK"], "12");
+    }
 }
