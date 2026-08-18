@@ -39,8 +39,8 @@ use ream_consensus_misc::constants::beacon::{
 };
 use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::p2p_sender::P2PSender;
-use ream_operation_pool::OperationPool;
 use ream_network_spec::networks::beacon_network_spec;
+use ream_operation_pool::OperationPool;
 use ream_p2p::{
     gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
     network::beacon::channel::GossipMessage,

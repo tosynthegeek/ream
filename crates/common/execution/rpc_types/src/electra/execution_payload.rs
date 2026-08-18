@@ -172,7 +172,9 @@ mod tests {
             parent_hash: b256!("9eba23403adfc7186ba8b484cf33b63edb357144427661022b1b9dac2b5637ed"),
             fee_recipient: address!("8943545177806ED17B9F23F0a21ee5948eCaa776"),
             state_root: b256!("f49c705b3d0a5fac1da62f0d8dfb218df0d4299a48ccf96157c6c1e35837eb14"),
-            receipts_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            receipts_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
             logs_bloom: FixedVector::new(vec![0u8; 256]).expect("bloom is 256 bytes"),
             prev_randao: b256!("9eba23403adfc7186ba8b484cf33b63edb357144427661022b1b9dac2b5637ed"),
             block_number: 1,

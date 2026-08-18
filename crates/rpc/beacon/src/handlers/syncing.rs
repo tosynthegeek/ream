@@ -12,7 +12,6 @@ use ream_operation_pool::OperationPool;
 use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
 use tracing::error;
 
-
 pub async fn calculate_sync_status(
     db: &BeaconDB,
     operation_pool: &Arc<OperationPool>,
