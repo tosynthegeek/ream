@@ -495,7 +495,14 @@ impl ExecutionApi for ExecutionEngine {
             return Ok(false);
         }
 
-        return Ok(self.notify_new_payload(new_payload_request).await? == PayloadStatus::Valid);
+        // Engine API: only INVALID / INVALID_BLOCK_HASH mean the payload is bad.
+        // SYNCING and ACCEPTED mean the EL cannot fully validate yet — do not
+        // reject the block or CL sync will stall while the EL is catching up.
+        let status = self.notify_new_payload(new_payload_request).await?;
+        Ok(matches!(
+            status,
+            PayloadStatus::Valid | PayloadStatus::Syncing | PayloadStatus::Accepted
+        ))
     }
 
     async fn engine_get_blobs_v1(
