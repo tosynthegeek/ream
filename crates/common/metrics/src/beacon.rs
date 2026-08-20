@@ -289,6 +289,41 @@ lazy_static::lazy_static! {
             default_registry()
         ).expect("failed to create BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS")
     };
+
+    // Gossip manager: worker-pool dispatch metrics
+    pub static ref BEACON_MANAGER_QUEUE_DEPTH: IntGauge = register_int_gauge_with_registry!(
+        "beacon_manager_queue_depth", "Number of pending ReamNetworkEvent messages in the manager receiver", default_registry()
+    ).expect("failed to create BEACON_MANAGER_QUEUE_DEPTH int gauge");
+
+    pub static ref BEACON_GOSSIP_BACKLOG_DEPTH: IntGauge = register_int_gauge_with_registry!(
+        "beacon_gossip_backlog_depth", "Number of gossip messages queued waiting for a free worker slot", default_registry()
+    ).expect("failed to create BEACON_GOSSIP_BACKLOG_DEPTH int gauge");
+
+    pub static ref BEACON_GOSSIP_WORKERS_IN_FLIGHT: IntGauge = register_int_gauge_with_registry!(
+        "beacon_gossip_workers_in_flight", "Number of gossip messages currently being validated concurrently", default_registry()
+    ).expect("failed to create BEACON_GOSSIP_WORKERS_IN_FLIGHT int gauge");
+
+    pub static ref BEACON_GOSSIP_HANDLE_SECONDS: Histogram = {
+        // Full handle_gossipsub_message wall time. 20ms is the warn threshold.
+        let opts = HistogramOpts::new(
+            "beacon_gossip_handle_seconds",
+            "Time spent in handle_gossipsub_message for one gossip message",
+        ).buckets(vec![0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]);
+        register_histogram_with_registry!(opts, default_registry())
+            .expect("failed to create BEACON_GOSSIP_HANDLE_SECONDS")
+    };
+
+    pub static ref BEACON_GOSSIP_HANDLE_SLOW_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_gossip_handle_slow_total", "Gossip messages whose handle_gossipsub_message exceeded the slow threshold", default_registry()
+    ).expect("failed to create BEACON_GOSSIP_HANDLE_SLOW_TOTAL int counter");
+
+    pub static ref BEACON_GOSSIP_MESSAGES_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_gossip_messages_total", "Total gossipsub messages processed by the network manager", default_registry()
+    ).expect("failed to create BEACON_GOSSIP_MESSAGES_TOTAL int counter");
+
+    pub static ref BEACON_GOSSIP_BACKLOG_DROPPED_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_gossip_backlog_dropped_total", "Gossip messages dropped because the backlog exceeded its cap", default_registry()
+    ).expect("failed to create BEACON_GOSSIP_BACKLOG_DROPPED_TOTAL int counter");
 }
 
 /// Zero-initializes gauges so dashboards show `0` instead of "no data" before the
@@ -296,6 +331,9 @@ lazy_static::lazy_static! {
 pub fn init_beacon_metrics() {
     set_int_gauge(&BEACON_CUSTODY_GROUPS, 0);
     set_int_gauge(&BEACON_CUSTODY_GROUPS_BACKFILLED, 0);
+    set_int_gauge(&BEACON_MANAGER_QUEUE_DEPTH, 0);
+    set_int_gauge(&BEACON_GOSSIP_BACKLOG_DEPTH, 0);
+    set_int_gauge(&BEACON_GOSSIP_WORKERS_IN_FLIGHT, 0);
     set_peer_count(0);
 }
 
