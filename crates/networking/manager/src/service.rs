@@ -1,10 +1,13 @@
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use ream_chain_beacon::beacon_chain::BeaconChain;
+use libp2p::{PeerId, gossipsub::MessageAcceptance};
+use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
+use ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock;
 use ream_consensus_misc::{
     constants::beacon::NUM_CUSTODY_GROUPS, misc::compute_start_slot_at_epoch,
 };
@@ -14,7 +17,11 @@ use ream_discv5::{
 };
 use ream_executor::ReamExecutor;
 use ream_fork_choice_beacon::data_availability::AvailabilityEntryStatus;
-use ream_metrics::BEACON_CUSTODY_GROUPS;
+use ream_metrics::{
+    BEACON_CUSTODY_GROUPS, BEACON_GOSSIP_BACKLOG_DEPTH, BEACON_GOSSIP_BACKLOG_DROPPED_TOTAL,
+    BEACON_GOSSIP_HANDLE_SECONDS, BEACON_GOSSIP_HANDLE_SLOW_TOTAL, BEACON_GOSSIP_MESSAGES_TOTAL,
+    BEACON_GOSSIP_WORKERS_IN_FLIGHT,
+};
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::{
     config::NetworkConfig,
@@ -27,21 +34,88 @@ use ream_storage::{
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use ream_syncer::block_range::BlockRangeSyncer;
-use tokio::{sync::mpsc, time::interval};
-use tracing::{error, info, warn};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    time::interval,
+};
+use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
 
 use crate::{
     block_lookup::{
         BlockLookupConfig, BlockLookupCoordinator, PendingGossipItem, apply_block_import_event,
-        apply_coordinator_update, insert_pending_item, log_insert_outcome,
-        spawn_block_lookup_worker,
+        apply_coordinator_update, import_validated_data_column, insert_pending_item,
+        log_insert_outcome, spawn_block_lookup_worker,
     },
     config::ManagerConfig,
-    gossipsub::handle::{handle_gossipsub_message, init_gossipsub_config_with_topics},
+    gossipsub::handle::{GossipWork, handle_gossipsub_message, init_gossipsub_config_with_topics},
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
 };
+
+/// Concurrent gossip validation workers (BLS / KZG / cheap checks).
+const GOSSIP_VALIDATE_CONCURRENCY: usize = 8;
+
+/// Cap on messages waiting for a validation worker. Oldest low-prio dropped first.
+const GOSSIP_VALIDATE_BACKLOG_CAP: usize = 2048;
+
+/// Bounded channels into the sequential block importer.
+const BLOCK_IMPORT_CHANNEL_CAP: usize = 64;
+
+/// Columns are independent of each other for DAC updates; a small pool is enough.
+const COLUMN_IMPORT_CONCURRENCY: usize = 4;
+
+const SLOW_GOSSIP_THRESHOLD: Duration = Duration::from_millis(500);
+
+struct GossipTask {
+    propagation_source: PeerId,
+    message_id: libp2p::gossipsub::MessageId,
+    message: libp2p::gossipsub::Message,
+    arrived_at: Instant,
+}
+
+struct GossipOutcome {
+    message_id: libp2p::gossipsub::MessageId,
+    propagation_source: PeerId,
+    acceptance: MessageAcceptance,
+    handle_elapsed: Duration,
+    total_elapsed: Duration,
+    work: Option<GossipWork>,
+}
+
+fn topic_is_block_or_column(message: &libp2p::gossipsub::Message) -> bool {
+    let t = message.topic.as_str();
+    t.contains("beacon_block") || t.contains("data_column_sidecar") || t.contains("blob_sidecar")
+}
+
+fn is_current_slot_block(block_slot: u64, current_slot: u64) -> bool {
+    // Prefer the live head and early next-slot arrivals.
+    block_slot == current_slot || block_slot == current_slot.saturating_add(1)
+}
+
+async fn run_validate_task(
+    task: GossipTask,
+    beacon_chain: Arc<BeaconChain>,
+    cached_db: Arc<BeaconCacheDB>,
+    p2p_sender: P2PSender,
+) -> GossipOutcome {
+    let handle_start = Instant::now();
+    let (acceptance, work) = handle_gossipsub_message(
+        task.message,
+        beacon_chain.as_ref(),
+        cached_db.as_ref(),
+        &p2p_sender,
+    )
+    .await;
+    GossipOutcome {
+        message_id: task.message_id,
+        propagation_source: task.propagation_source,
+        acceptance,
+        handle_elapsed: handle_start.elapsed(),
+        total_elapsed: task.arrived_at.elapsed(),
+        work,
+    }
+}
 
 pub struct NetworkManagerService {
     pub beacon_chain: Arc<BeaconChain>,
@@ -220,8 +294,78 @@ impl NetworkManagerService {
             spawn_block_lookup_worker(beacon_chain.clone());
         let mut block_lookup_worker_active = true;
         let mut syncer_handle = block_range_syncer.start();
-        // Avoid polling a completed JoinHandle after the syncer has caught up.
         let mut syncer_active = true;
+
+        // Refreshed on every slot tick; used for current-slot priority (lock-free).
+        let mut cached_current_slot: u64 = {
+            let store = beacon_chain.store.lock().await;
+            store.get_current_slot().unwrap_or(0)
+        };
+
+        // ---- validation worker pool ------------------------------------
+        let validate_semaphore = Arc::new(Semaphore::new(GOSSIP_VALIDATE_CONCURRENCY));
+        let mut validate_high: VecDeque<GossipTask> = VecDeque::new();
+        let mut validate_low: VecDeque<GossipTask> = VecDeque::new();
+        let (validate_outcome_tx, mut validate_outcome_rx) =
+            mpsc::unbounded_channel::<GossipOutcome>();
+
+        // ---- sequential prioritised block importer ---------------------
+        // Two channels; the worker always prefers high (current-slot) via
+        // `tokio::select! { biased; ... }`. process_block never runs on the
+        // manager task, so the network loop stays responsive.
+        let (block_high_tx, mut block_high_rx) =
+            mpsc::channel::<Box<SignedBeaconBlock>>(BLOCK_IMPORT_CHANNEL_CAP);
+        let (block_low_tx, mut block_low_rx) =
+            mpsc::channel::<Box<SignedBeaconBlock>>(BLOCK_IMPORT_CHANNEL_CAP);
+        {
+            let beacon_chain = beacon_chain.clone();
+            tokio::spawn(async move {
+                loop {
+                    let signed_block = tokio::select! {
+                        biased;
+                        Some(b) = block_high_rx.recv() => b,
+                        Some(b) = block_low_rx.recv() => b,
+                        else => break,
+                    };
+                    let slot = signed_block.message.slot;
+                    let root = signed_block.message.tree_hash_root();
+                    info!(block_slot = slot, root = %root, "block import start");
+
+                    let start = Instant::now();
+
+                    match beacon_chain.process_block(*signed_block).await {
+                        Ok(BlockProcessingOutcome::Imported { .. }) => {
+                            info!(
+                                block_slot = slot,
+                                root = %root,
+                                elapsed = ?start.elapsed(),
+                                "block import finished (imported)"
+                            );
+                        }
+                        Ok(BlockProcessingOutcome::PendingAvailability { .. }) => {
+                            info!(
+                                block_slot = slot,
+                                root = %root,
+                                elapsed = ?start.elapsed(),
+                                "block import finished (pending availability)"
+                            );
+                        }
+                        Err(err) => {
+                            error!(
+                                block_slot = slot,
+                                root = %root,
+                                elapsed = ?start.elapsed(),
+                                "Failed to process gossipsub beacon block: {err}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        // ---- column importer -------------------------------------------
+        let column_semaphore = Arc::new(Semaphore::new(COLUMN_IMPORT_CONCURRENCY));
+
         loop {
             tokio::select! {
                 permit = block_lookup_action_sender.reserve(), if block_lookup_worker_active
@@ -349,6 +493,14 @@ impl NetworkManagerService {
                     };
                     match slots {
                         (Ok(current_slot), Ok(finalized_checkpoint)) => {
+                            if current_slot != cached_current_slot {
+                                debug!(
+                                    old = cached_current_slot,
+                                    new = current_slot,
+                                    "cached current slot updated"
+                                );
+                            }
+                            cached_current_slot = current_slot;
                             block_lookup_coordinator.prune(
                                 current_slot,
                                 compute_start_slot_at_epoch(finalized_checkpoint.epoch),
@@ -358,51 +510,171 @@ impl NetworkManagerService {
                         (_, Err(err)) => error!("Failed to read finalized checkpoint: {err}"),
                     }
                 }
+
+                permit = validate_semaphore.clone().acquire_owned(),
+                    if !validate_high.is_empty() || !validate_low.is_empty() =>
+                {
+                    let permit = permit.expect("validate semaphore closed");
+                    let task = validate_high
+                        .pop_front()
+                        .or_else(|| validate_low.pop_front())
+                        .expect("checked non-empty");
+
+                    BEACON_GOSSIP_BACKLOG_DEPTH
+                        .set((validate_high.len() + validate_low.len()) as i64);
+                    BEACON_GOSSIP_WORKERS_IN_FLIGHT.set(
+                        (GOSSIP_VALIDATE_CONCURRENCY - validate_semaphore.available_permits())
+                            as i64,
+                    );
+
+                    let beacon_chain = beacon_chain.clone();
+                    let cached_db = cached_db.clone();
+                    let p2p_sender = p2p_sender.clone();
+                    let validate_outcome_tx = validate_outcome_tx.clone();
+                    let runtime = tokio::runtime::Handle::current();
+
+                    // CPU-bound verification (BLS / KZG) runs on the blocking pool;
+                    // the async handle is driven via the existing runtime.
+                    tokio::task::spawn_blocking(move || {
+                        let outcome = runtime.block_on(run_validate_task(
+                            task,
+                            beacon_chain,
+                            cached_db,
+                            p2p_sender,
+                        ));
+                        let _ = validate_outcome_tx.send(outcome);
+                        drop(permit);
+                    });
+                }
+
+                // ===== apply validation outcome =====
+                Some(outcome) = validate_outcome_rx.recv() => {
+                    BEACON_GOSSIP_HANDLE_SECONDS.observe(outcome.handle_elapsed.as_secs_f64());
+                    BEACON_GOSSIP_MESSAGES_TOTAL.inc();
+                    BEACON_GOSSIP_WORKERS_IN_FLIGHT.set(
+                        (GOSSIP_VALIDATE_CONCURRENCY - validate_semaphore.available_permits())
+                            as i64,
+                    );
+
+                    if outcome.total_elapsed > SLOW_GOSSIP_THRESHOLD
+                        || outcome.handle_elapsed > SLOW_GOSSIP_THRESHOLD
+                    {
+                        BEACON_GOSSIP_HANDLE_SLOW_TOTAL.inc();
+                        warn!(
+                            total = ?outcome.total_elapsed,
+                            handle = ?outcome.handle_elapsed,
+                            message_id = %outcome.message_id,
+                            "slow gossipsub message handling"
+                        );
+                    }
+
+                    // Report to the mesh immediately — before any import work.
+                    p2p_sender.report_gossip_validation(
+                        outcome.message_id,
+                        outcome.propagation_source,
+                        outcome.acceptance,
+                    );
+
+                    match outcome.work {
+                        Some(GossipWork::Block(signed_block)) => {
+                            let slot = signed_block.message.slot;
+                            let high = is_current_slot_block(slot, cached_current_slot);
+
+                            info!(
+                                block_slot = slot,
+                                current_slot = cached_current_slot,
+                                priority = if high { "high" } else { "low" },
+                                root = %signed_block.message.tree_hash_root(),
+                                "queue block for import"
+                            );
+
+                            let tx = if high { &block_high_tx } else { &block_low_tx };
+                            if let Err(err) = tx.try_send(signed_block) {
+                                error!(
+                                    block_slot = slot,
+                                    current_slot = cached_current_slot,
+                                    priority = if high { "high" } else { "low" },
+                                    "block import channel full, dropping block: {err}"
+                                );
+                            }
+                        }
+                        Some(GossipWork::Column(sidecar)) => {
+                            let beacon_chain = beacon_chain.clone();
+                            let column_semaphore = column_semaphore.clone();
+                            tokio::spawn(async move {
+                                let Ok(permit) = column_semaphore.acquire_owned().await else {
+                                    return;
+                                };
+                                let _permit = permit;
+                                if let Err(err) =
+                                    import_validated_data_column(&beacon_chain, *sidecar).await
+                                {
+                                    error!("Failed to import data_column_sidecar: {err}");
+                                }
+                            });
+                        }
+                        Some(GossipWork::Pending(item)) => {
+                            let block_root = match &item {
+                                PendingGossipItem::Block { block, .. } => {
+                                    block.block().message.tree_hash_root()
+                                }
+                                PendingGossipItem::Column { column, .. } => column
+                                    .sidecar()
+                                    .signed_block_header
+                                    .message
+                                    .tree_hash_root(),
+                            };
+                            log_insert_outcome(
+                                block_root,
+                                insert_pending_item(
+                                    &mut block_lookup_coordinator,
+                                    item,
+                                    cached_current_slot,
+                                ),
+                            );
+                        }
+                        None => {}
+                    }
+                }
+
                 Some(event) = manager_receiver.recv() => {
                     match event {
                         // Handles Gossipsub messages from other peers.
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message } => {
-                            let mut pending_item = None;
-                            let acceptance = handle_gossipsub_message(
-                                message,
-                                &beacon_chain,
-                                &cached_db,
-                                &p2p_sender,
-                                &mut pending_item,
-                            ).await;
-                            p2p_sender.report_gossip_validation(
-                                message_id,
+                            let task = GossipTask {
                                 propagation_source,
-                                acceptance,
-                            );
+                                message_id,
+                                message,
+                                arrived_at: Instant::now(),
+                            };
 
-                            if let Some(item) = pending_item {
-                                let block_root = match &item {
-                                    PendingGossipItem::Block { block, .. } => {
-                                        block.block().message.tree_hash_root()
-                                    }
-                                    PendingGossipItem::Column { column, .. } => {
-                                        column.sidecar().signed_block_header.message.tree_hash_root()
-                                    }
-                                };
-                                let current_slot = {
-                                    let store = beacon_chain.store.lock().await;
-                                    store.get_current_slot()
-                                };
-                                match current_slot {
-                                    Ok(current_slot) => log_insert_outcome(
-                                        block_root,
-                                        insert_pending_item(
-                                            &mut block_lookup_coordinator,
-                                            item,
-                                            current_slot,
-                                        ),
-                                    ),
-                                    Err(err) => {
-                                        error!("Failed to read current slot for pending gossip: {err}")
+                            // Blocks/columns share the high validation queue so they
+                            // are validated before attestations under load.
+                            if topic_is_block_or_column(&task.message) {
+                                if validate_high.len() >= GOSSIP_VALIDATE_BACKLOG_CAP {
+                                    error!(
+                                        message_id = %task.message_id,
+                                        "high-prio validation backlog full; dropping message"
+                                    );
+                                    BEACON_GOSSIP_BACKLOG_DROPPED_TOTAL.inc();
+                                } else {
+                                    validate_high.push_back(task);
+                                }
+                            } else {
+                                if validate_low.len() >= GOSSIP_VALIDATE_BACKLOG_CAP {
+                                    if let Some(dropped) = validate_low.pop_front() {
+                                        BEACON_GOSSIP_BACKLOG_DROPPED_TOTAL.inc();
+                                        warn!(
+                                            message_id = %dropped.message_id,
+                                            "low-prio validation backlog over cap, dropping oldest"
+                                        );
                                     }
                                 }
+                                validate_low.push_back(task);
                             }
+
+                            BEACON_GOSSIP_BACKLOG_DEPTH
+                                .set((validate_high.len() + validate_low.len()) as i64);
                         }
                         // Handles Req/Resp messages from other peers.
                         ReamNetworkEvent::RequestMessage { peer_id, stream_id, connection_id, message } =>

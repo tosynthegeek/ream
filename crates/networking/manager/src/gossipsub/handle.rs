@@ -2,9 +2,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
-use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier, data_column_sidecar::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
+    data_column_sidecar::DataColumnSidecar, electra::beacon_block::SignedBeaconBlock,
     single_attestation::SingleAttestation,
 };
 use ream_consensus_misc::constants::beacon::{
@@ -33,7 +34,7 @@ use tracing::{error, info, trace, warn};
 use tree_hash::TreeHash;
 
 use crate::{
-    block_lookup::{PendingGossipItem, import_validated_data_column},
+    block_lookup::PendingGossipItem,
     gossipsub::validate::{
         aggregate_and_proof::validate_aggregate_and_proof,
         attester_slashing::validate_attester_slashing,
@@ -52,6 +53,17 @@ use crate::{
     },
     p2p_sender::P2PSender,
 };
+
+/// Work that must not run on the gossip/validation path.
+/// The manager dispatches these to dedicated processors.
+pub enum GossipWork {
+    /// Fully validated block — run `process_block` on the block importer.
+    Block(Box<SignedBeaconBlock>),
+    /// Fully validated column — import on the column path.
+    Column(Box<DataColumnSidecar>),
+    /// Parent is only pending availability — hand to the existing coordinator.
+    Pending(PendingGossipItem),
+}
 
 pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> GossipsubConfig {
     let mut gossipsub_config = history_length.map_or_else(
@@ -204,8 +216,7 @@ pub async fn handle_gossipsub_message(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     p2p_sender: &P2PSender,
-    pending_item: &mut Option<PendingGossipItem>,
-) -> MessageAcceptance {
+) -> (MessageAcceptance, Option<GossipWork>) {
     match GossipsubMessage::decode(&message.topic, &message.data) {
         Ok(gossip_message) => match gossip_message {
             GossipsubMessage::BeaconBlock(signed_block) => {
@@ -223,7 +234,7 @@ pub async fn handle_gossipsub_message(
                 };
                 if let Err(err) = beacon_chain.process_tick(tick_time).await {
                     warn!("Failed to process gossipsub tick before block validation: {err}");
-                    return MessageAcceptance::Ignore;
+                    return (MessageAcceptance::Ignore, None);
                 }
 
                 let validation_result = match validate_gossip_beacon_block(
@@ -236,38 +247,34 @@ pub async fn handle_gossipsub_message(
                     Ok(result) => result,
                     Err(err) => {
                         warn!("Failed to validate gossipsub beacon block: {err}");
-                        return MessageAcceptance::Ignore;
+                        return (MessageAcceptance::Ignore, None);
                     }
                 };
 
                 let acceptance = dependency_message_acceptance(&validation_result);
-                match validation_result {
+                let work = match validation_result {
                     DependencyValidationResult::Accept => {
-                        let signed_block_bytes = signed_block.as_ssz_bytes();
-                        match beacon_chain.process_block(*signed_block).await {
-                            Ok(BlockProcessingOutcome::Imported { .. }) => {}
-                            Ok(BlockProcessingOutcome::PendingAvailability { .. }) => {}
-                            Err(err) => {
-                                error!("Failed to process gossipsub beacon block: {err}");
-                            }
-                        }
-                        forward_gossip_message(&message, p2p_sender, signed_block_bytes);
+                        forward_gossip_message(&message, p2p_sender, signed_block.as_ssz_bytes());
+                        Some(GossipWork::Block(signed_block))
                     }
                     DependencyValidationResult::Ignore(reason) => {
                         warn!("Ignoring gossipsub beacon block: {reason}");
+                        None
                     }
                     DependencyValidationResult::Reject(reason) => {
                         warn!("Rejecting gossipsub beacon block: {reason}");
+                        None
                     }
                     DependencyValidationResult::ParentPendingAvailability {
                         parent_root: _,
                         validated,
-                    } => {
-                        *pending_item = Some(PendingGossipItem::Block { block: validated });
-                    }
-                }
-                acceptance
+                    } => Some(GossipWork::Pending(PendingGossipItem::Block {
+                        block: validated,
+                    })),
+                };
+                (acceptance, work)
             }
+
             GossipsubMessage::BeaconAttestation((single_attestation, subnet_id)) => {
                 trace!(
                     "Beacon Attestation received over gossipsub: root: {}",
@@ -285,7 +292,7 @@ pub async fn handle_gossipsub_message(
                     Ok(validation_result) => validation_result,
                     Err(err) => {
                         trace!("Could not validate attestation: {err}");
-                        return MessageAcceptance::Ignore;
+                        return (MessageAcceptance::Ignore, None);
                     }
                 };
 
@@ -310,7 +317,7 @@ pub async fn handle_gossipsub_message(
                         info!("Attestation ignored: {reason}");
                     }
                 }
-                acceptance
+                (acceptance, None)
             }
             GossipsubMessage::BlsToExecutionChange(signed_bls_to_execution_change) => {
                 info!(
@@ -344,7 +351,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate BLS to Execution Change: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::AggregateAndProof(aggregate_and_proof) => {
                 info!(
@@ -374,7 +381,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate aggregate and proof: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::SyncCommittee((sync_committee, subnet_id)) => {
                 trace!(
@@ -404,7 +411,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate sync committee message: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::SyncCommitteeContributionAndProof(signed_contribution_and_proof) => {
                 info!(
@@ -439,7 +446,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate sync committee contribution and proof: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::AttesterSlashing(attester_slashing) => {
                 info!(
@@ -471,7 +478,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate attester slashing: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::ProposerSlashing(proposer_slashing) => {
                 info!(
@@ -500,7 +507,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate proposer slashing: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::BlobSidecar(blob_sidecar) => {
                 info!(
@@ -551,30 +558,20 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate blob_sidecar: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::DataColumnSidecar(data_column_sidecar) => {
-                info!(
-                    "Data Column Sidecar received over gossipsub: index: {}, root: {}",
-                    data_column_sidecar.index,
-                    data_column_sidecar
-                        .signed_block_header
-                        .message
-                        .tree_hash_root()
-                );
-
-                // Extract subnet_id from the gossip topic
                 let subnet_id = match GossipTopic::from_topic_hash(&message.topic) {
                     Ok(topic) => match topic.kind {
                         GossipTopicKind::DataColumnSidecar(id) => id,
                         _ => {
                             error!("Unexpected topic kind for data column sidecar");
-                            return MessageAcceptance::Ignore;
+                            return (MessageAcceptance::Ignore, None);
                         }
                     },
                     Err(err) => {
                         error!("Failed to parse topic for data column sidecar: {err}");
-                        return MessageAcceptance::Ignore;
+                        return (MessageAcceptance::Ignore, None);
                     }
                 };
 
@@ -582,7 +579,7 @@ pub async fn handle_gossipsub_message(
                     Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     Err(err) => {
                         error!("Failed to get current time for data column validation: {err}");
-                        return MessageAcceptance::Ignore;
+                        return (MessageAcceptance::Ignore, None);
                     }
                 };
 
@@ -598,34 +595,33 @@ pub async fn handle_gossipsub_message(
                     Ok(validation_result) => validation_result,
                     Err(err) => {
                         error!("Could not validate data_column_sidecar: {err}");
-                        return MessageAcceptance::Ignore;
+                        return (MessageAcceptance::Ignore, None);
                     }
                 };
 
                 let acceptance = dependency_message_acceptance(&validation_result);
-                match validation_result {
+                let work = match validation_result {
                     DependencyValidationResult::Accept => {
-                        if let Err(err) =
-                            import_validated_data_column(beacon_chain, *data_column_sidecar).await
-                        {
-                            error!("Failed to import data_column_sidecar: {err}");
-                        }
+                        Some(GossipWork::Column(data_column_sidecar))
                     }
                     DependencyValidationResult::Reject(reason) => {
                         info!("Data column sidecar rejected: {reason}");
+                        None
                     }
                     DependencyValidationResult::Ignore(reason) => {
                         info!("Data column sidecar ignored: {reason}");
+                        None
                     }
                     DependencyValidationResult::ParentPendingAvailability {
                         parent_root: _,
                         validated,
-                    } => {
-                        *pending_item = Some(PendingGossipItem::Column { column: validated });
-                    }
-                }
-                acceptance
+                    } => Some(GossipWork::Pending(PendingGossipItem::Column {
+                        column: validated,
+                    })),
+                };
+                (acceptance, work)
             }
+
             GossipsubMessage::LightClientFinalityUpdate(light_client_finality_update) => {
                 info!(
                     "Light Client Finality Update received over gossipsub: root: {}",
@@ -657,7 +653,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate light client finality update: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::LightClientOptimisticUpdate(light_client_optimistic_update) => {
                 info!(
@@ -694,7 +690,7 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate light client optimistic update: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
             GossipsubMessage::VoluntaryExit(voluntary_exit) => {
                 info!(
@@ -722,12 +718,12 @@ pub async fn handle_gossipsub_message(
                         error!("Could not validate voluntary_exit: {err}");
                     }
                 }
-                MessageAcceptance::Ignore
+                (MessageAcceptance::Ignore, None)
             }
         },
         Err(err) => {
             trace!("Failed to decode gossip message: {err:?}");
-            MessageAcceptance::Reject
+            (MessageAcceptance::Reject, None)
         }
     }
 }
@@ -806,15 +802,8 @@ mod tests {
             sequence_number: None,
             topic,
         };
-        let mut pending_item = None;
-        let acceptance = handle_gossipsub_message(
-            message,
-            &beacon_chain,
-            &cached_db,
-            &p2p_sender,
-            &mut pending_item,
-        )
-        .await;
+        let (acceptance, _) =
+            handle_gossipsub_message(message, &beacon_chain, &cached_db, &p2p_sender).await;
 
         assert!(
             matches!(acceptance, MessageAcceptance::Reject),

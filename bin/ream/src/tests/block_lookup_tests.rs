@@ -30,7 +30,7 @@ use ream_network_manager::{
         BlockLookupConfig, BlockLookupCoordinator, InsertOutcome, apply_block_import_event,
         apply_coordinator_update, execute_coordinator_action, insert_pending_item,
     },
-    gossipsub::handle::{Message, MessageAcceptance, handle_gossipsub_message},
+    gossipsub::handle::{GossipWork, Message, MessageAcceptance, handle_gossipsub_message},
     p2p_sender::P2PSender,
 };
 use ream_operation_pool::OperationPool;
@@ -232,8 +232,7 @@ impl GossipLookupHarness {
             ),
             kind,
         };
-        let mut pending_item = None;
-        let acceptance = handle_gossipsub_message(
+        let (acceptance, gossipp_work) = handle_gossipsub_message(
             Message {
                 source: None,
                 data,
@@ -243,24 +242,28 @@ impl GossipLookupHarness {
             &self.beacon_chain,
             &self.cached_db,
             &self.p2p_sender,
-            &mut pending_item,
         )
         .await;
 
         let mut outcomes = Vec::new();
-        if let Some(item) = pending_item {
-            let current_slot = self
-                .beacon_chain
-                .store
-                .lock()
-                .await
-                .get_current_slot()
-                .expect("current slot should be available");
-            outcomes.push(insert_pending_item(
-                &mut self.coordinator,
-                item,
-                current_slot,
-            ));
+        if let Some(work) = gossipp_work {
+            match work {
+                GossipWork::Pending(item) => {
+                    let current_slot = self
+                        .beacon_chain
+                        .store
+                        .lock()
+                        .await
+                        .get_current_slot()
+                        .expect("current slot should be available");
+                    outcomes.push(insert_pending_item(
+                        &mut self.coordinator,
+                        item,
+                        current_slot,
+                    ));
+                }
+                _ => {}
+            }
         }
         (acceptance, outcomes)
     }
