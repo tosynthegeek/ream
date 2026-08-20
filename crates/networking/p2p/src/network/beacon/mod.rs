@@ -22,6 +22,7 @@ use libp2p::{
     futures::StreamExt,
     gossipsub::{
         Event as GossipsubEvent, IdentTopic as Topic, Message, MessageAuthenticity, MessageId,
+        PublishError,
     },
     identify,
     multiaddr::Protocol,
@@ -369,7 +370,13 @@ impl Network {
                         },
                         P2PMessage::Gossip(message) => {
                             if let Err(err) = self.swarm.behaviour_mut().gossipsub.publish(message.topic, message.data) {
-                                warn!("Failed to publish gossip message: {err}");
+                                match err {
+                                    PublishError::Duplicate => {
+                                        trace!("Duplicate gossipsub message: {:?}", message.topic);
+                                    }
+                                    other => warn!("Failed to publish gossip message: {other:?}"),
+                                }
+
                             }
                         }
                         P2PMessage::ReportGossipValidation { message_id, propagation_source, acceptance } => {
