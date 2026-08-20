@@ -324,6 +324,18 @@ lazy_static::lazy_static! {
     pub static ref BEACON_GOSSIP_BACKLOG_DROPPED_TOTAL: IntCounter = register_int_counter_with_registry!(
         "beacon_gossip_backlog_dropped_total", "Gossip messages dropped because the backlog exceeded its cap", default_registry()
     ).expect("failed to create BEACON_GOSSIP_BACKLOG_DROPPED_TOTAL int counter");
+
+    pub static ref BEACON_BLOCK_IMPORT_QUEUE_DEPTH: IntGauge = register_int_gauge_with_registry!(
+        "beacon_block_import_queue_depth",
+        "Blocks waiting on the dedicated block importer (high + low priority)",
+        default_registry()
+    ).expect("failed to create BEACON_BLOCK_IMPORT_QUEUE_DEPTH");
+
+    pub static ref BEACON_BLOCK_IMPORT_DROPPED_TOTAL: IntCounter = register_int_counter_with_registry!(
+        "beacon_block_import_dropped_total",
+        "Validated blocks dropped because the block-import queue was full",
+        default_registry()
+    ).expect("failed to create BEACON_BLOCK_IMPORT_DROPPED_TOTAL");
 }
 
 /// Zero-initializes gauges so dashboards show `0` instead of "no data" before the
@@ -334,6 +346,7 @@ pub fn init_beacon_metrics() {
     set_int_gauge(&BEACON_MANAGER_QUEUE_DEPTH, 0);
     set_int_gauge(&BEACON_GOSSIP_BACKLOG_DEPTH, 0);
     set_int_gauge(&BEACON_GOSSIP_WORKERS_IN_FLIGHT, 0);
+    set_int_gauge(&BEACON_BLOCK_IMPORT_QUEUE_DEPTH, 0);
     set_peer_count(0);
 }
 
