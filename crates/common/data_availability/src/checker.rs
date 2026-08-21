@@ -137,6 +137,36 @@ impl<State> DataAvailabilityChecker<State> {
 
         self.required_columns.is_subset(&entry.received_columns)
     }
+
+    pub fn received_column_count(&self, block_root: &B256) -> usize {
+        self.entries
+            .get(block_root)
+            .map(|e| e.received_columns.len())
+            .unwrap_or(0)
+    }
+
+    pub fn missing_required_columns(&self, block_root: &B256) -> Vec<u64> {
+        let Some(entry) = self.entries.get(block_root) else {
+            return self.required_columns.iter().copied().collect();
+        };
+        self.required_columns
+            .difference(&entry.received_columns)
+            .copied()
+            .collect()
+    }
+
+    pub fn can_attempt_reconstruction(&self, block_root: &B256, min_columns: usize) -> bool {
+        let Some(entry) = self.entries.get(block_root) else {
+            return false;
+        };
+        if entry.pending_block.is_none() {
+            return false;
+        }
+        if self.is_complete(entry) {
+            return false;
+        }
+        entry.received_columns.len() >= min_columns
+    }
 }
 
 #[cfg(test)]

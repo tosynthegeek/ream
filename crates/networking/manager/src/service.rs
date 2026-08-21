@@ -560,12 +560,12 @@ impl NetworkManagerService {
                         || outcome.handle_elapsed > SLOW_GOSSIP_THRESHOLD
                     {
                         BEACON_GOSSIP_HANDLE_SLOW_TOTAL.inc();
-                        warn!(
-                            total = ?outcome.total_elapsed,
-                            handle = ?outcome.handle_elapsed,
-                            message_id = %outcome.message_id,
-                            "slow gossipsub message handling"
-                        );
+                        // warn!(
+                        //     total = ?outcome.total_elapsed,
+                        //     handle = ?outcome.handle_elapsed,
+                        //     message_id = %outcome.message_id,
+                        //     "slow gossipsub message handling"
+                        // );
                     }
 
                     // Report to the mesh immediately — before any import work.

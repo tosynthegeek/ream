@@ -28,6 +28,33 @@ pub struct MatrixEntry {
     row_index: u64,
 }
 
+impl MatrixEntry {
+    pub fn cell(&self) -> &Cell {
+        &self.cell
+    }
+
+    pub fn kzg_proof(&self) -> &KZGProof {
+        &self.kzg_proof
+    }
+
+    pub fn column_index(&self) -> u64 {
+        self.column_index
+    }
+
+    pub fn row_index(&self) -> u64 {
+        self.row_index
+    }
+
+    pub fn new(cell: Cell, kzg_proof: KZGProof, column_index: u64, row_index: u64) -> Self {
+        Self {
+            cell,
+            kzg_proof,
+            column_index,
+            row_index,
+        }
+    }
+}
+
 pub fn compute_matrix(blobs: Vec<Blob>, das_context: &DASContext) -> Result<Vec<MatrixEntry>> {
     let mut matrix = Vec::new();
 

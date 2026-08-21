@@ -38,8 +38,12 @@ use ream_storage::{
 };
 use ream_sync_committee_pool::SyncCommitteePool;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
+
+use crate::column_reconstruction::{
+    reconstruct_sidecars_for_block, reconstruction_column_threshold,
+};
 
 pub const BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
@@ -54,6 +58,12 @@ pub enum BlockProcessingOutcome {
 pub enum BlockImportEvent {
     Imported { block_root: B256 },
     PendingAvailability { block_root: B256 },
+}
+
+struct ColumnReconstructionSnapshot {
+    block_root: B256,
+    present: Vec<DataColumnSidecar>,
+    missing: Vec<u64>,
 }
 
 /// BeaconChain is the main struct which manages the nodes local beacon chain.
@@ -184,23 +194,171 @@ impl BeaconChain {
         let block_root = sidecar.signed_block_header.message.tree_hash_root();
         let column_index = sidecar.index;
         let slot = sidecar.signed_block_header.message.slot;
-        let mut store = self.store.lock().await;
-        validate_release(&store)?;
-        store
-            .db
-            .column_sidecars_provider()
-            .insert(ColumnIdentifier::new(block_root, column_index), sidecar)?;
-        let imported_block =
-            self.process_data_column_sidecar_locked(&mut store, block_root, column_index, slot)?;
-        drop(store);
+        let snapshot = {
+            let mut store = self.store.lock().await;
+            validate_release(&store)?;
 
-        if let Some((imported_block_root, block_event)) = imported_block {
-            self.notify_block_imported(imported_block_root);
+            store
+                .db
+                .column_sidecars_provider()
+                .insert(ColumnIdentifier::new(block_root, column_index), sidecar)?;
+
+            if store.db.block_provider().get(block_root)?.is_some() {
+                return Ok(());
+            }
+
+            store
+                .data_availability_checker
+                .add_column(block_root, column_index, slot);
+
+            if let Some(pending) = store.data_availability_checker.take_if_complete(block_root) {
+                let (imported_root, block_event) =
+                    self.import_available_block(&mut store, pending)?;
+                drop(store);
+                self.notify_block_imported(imported_root);
+                self.publish_block_event(block_event);
+                self.update_execution_forkchoice(true).await;
+                return Ok(());
+            }
+
+            self.snapshot_for_reconstruction(&store, block_root)?
+        };
+
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+
+        let recovered = match reconstruct_sidecars_for_block(
+            snapshot.block_root,
+            &snapshot.present,
+            &snapshot.missing,
+        ) {
+            Ok(sidecars) => sidecars,
+            Err(err) => {
+                warn!(
+                    block_root = %snapshot.block_root,
+                    "data column reconstruction failed (gossip column kept): {err}"
+                );
+                return Ok(());
+            }
+        };
+
+        if recovered.is_empty() {
+            return Ok(());
+        }
+
+        // ----- Phase 3: re-take lock, re-validate, commit -----
+        let imported = {
+            let mut store = self.store.lock().await;
+            self.commit_reconstructed_columns(&mut store, snapshot.block_root, recovered)?
+        };
+
+        if let Some((imported_root, block_event)) = imported {
+            self.notify_block_imported(imported_root);
             self.publish_block_event(block_event);
             self.update_execution_forkchoice(true).await;
         }
 
         Ok(())
+    }
+
+    fn snapshot_for_reconstruction(
+        &self,
+        store: &Store,
+        block_root: B256,
+    ) -> anyhow::Result<Option<ColumnReconstructionSnapshot>> {
+        let min_columns = reconstruction_column_threshold();
+        if !store
+            .data_availability_checker
+            .can_attempt_reconstruction(&block_root, min_columns)
+        {
+            return Ok(None);
+        }
+
+        let missing = store
+            .data_availability_checker
+            .missing_required_columns(&block_root);
+        if missing.is_empty() {
+            return Ok(None);
+        }
+
+        let mut present = Vec::new();
+        for index in store
+            .data_availability_checker
+            .required_columns()
+            .iter()
+            .copied()
+        {
+            let id = ColumnIdentifier::new(block_root, index);
+            if let Some(sidecar) = store.db.column_sidecars_provider().get(id)? {
+                present.push(sidecar);
+            }
+        }
+
+        if present.len() < min_columns {
+            return Ok(None);
+        }
+
+        Ok(Some(ColumnReconstructionSnapshot {
+            block_root,
+            present,
+            missing,
+        }))
+    }
+
+    /// Under lock: insert reconstructed columns that are still missing, then
+    /// complete the pending block if DA is now satisfied.
+    fn commit_reconstructed_columns(
+        &self,
+        store: &mut Store,
+        block_root: B256,
+        recovered: Vec<DataColumnSidecar>,
+    ) -> anyhow::Result<Option<(B256, Option<BeaconEvent>)>> {
+        // Lost the race: block already fully imported.
+        if store.db.block_provider().get(block_root)?.is_some() {
+            return Ok(None);
+        }
+
+        // Pending block must still be present; otherwise another path completed or pruned it.
+        if store
+            .data_availability_checker
+            .pending_block(&block_root)
+            .is_none()
+        {
+            return Ok(None);
+        }
+
+        let mut added = 0u64;
+        for sidecar in recovered {
+            let index = sidecar.index;
+            let slot = sidecar.signed_block_header.message.slot;
+            let id = ColumnIdentifier::new(block_root, index);
+
+            // Never overwrite a column that arrived from gossip while we were reconstructing.
+            if store.db.column_sidecars_provider().get(id)?.is_some() {
+                continue;
+            }
+
+            store.db.column_sidecars_provider().insert(id, sidecar)?;
+            store
+                .data_availability_checker
+                .add_column(block_root, index, slot);
+            added += 1;
+        }
+
+        if added > 0 {
+            info!(
+                %block_root,
+                reconstructed = added,
+                "committed reconstructed data columns"
+            );
+        }
+
+        if let Some(pending) = store.data_availability_checker.take_if_complete(block_root) {
+            Ok(Some(self.import_available_block(store, pending)?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn process_data_column_sidecar_locked(
@@ -219,6 +377,7 @@ impl BeaconChain {
         store
             .data_availability_checker
             .add_column(block_root, column_index, slot);
+
         if let Some(pending) = store.data_availability_checker.take_if_complete(block_root) {
             Ok(Some(self.import_available_block(store, pending)?))
         } else {
