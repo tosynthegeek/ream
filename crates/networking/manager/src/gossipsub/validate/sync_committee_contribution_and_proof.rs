@@ -32,19 +32,13 @@ pub async fn validate_sync_committee_contribution_and_proof(
     let store = beacon_chain.store.lock().await;
     let head_root = store.get_head()?;
 
-    let block = store
-        .db
-        .block_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("Could not get block for head root: {head_root}"))?;
-
     let state = store
         .db
         .state_provider()
         .get(head_root)?
         .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
 
-    let current_slot: u64 = block.message.slot;
+    let current_slot: u64 = store.get_current_slot()?;
 
     // [IGNORE] if contribution.slot is equal to or earlier than the current_slot (with a
     // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)

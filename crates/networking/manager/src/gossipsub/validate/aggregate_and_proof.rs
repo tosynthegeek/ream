@@ -34,13 +34,7 @@ pub async fn validate_aggregate_and_proof(
         .get(head_root)?
         .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
 
-    let block = store
-        .db
-        .block_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("Could not get block for head root: {head_root}"))?;
-
-    let current_slot = block.message.slot;
+    let current_slot = store.get_current_slot()?;
     let aggregate_and_proof = &signed_aggregate_and_proof.message;
     let attestation = &aggregate_and_proof.aggregate;
     let attestation_slot = attestation.data.slot;
