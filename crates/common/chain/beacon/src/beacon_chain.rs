@@ -434,11 +434,6 @@ impl BeaconChain {
             return;
         };
 
-        // Recompute after serialization so a delayed import cannot send stale state last.
-        let mut last_forkchoice = self.execution_forkchoice.lock().await;
-        if last_forkchoice.is_none() && !allow_initial_update {
-            return;
-        }
         let forkchoice_state = {
             let store = self.store.lock().await;
             self.build_forkchoice_state(&store)
@@ -446,22 +441,40 @@ impl BeaconChain {
         let Some(forkchoice_state) = forkchoice_state else {
             return;
         };
-        if last_forkchoice.as_ref() == Some(&forkchoice_state) {
-            return;
+
+        {
+            let last_forkchoice = self.execution_forkchoice.lock().await;
+            if last_forkchoice.is_none() && !allow_initial_update {
+                return;
+            }
+            if last_forkchoice.as_ref() == Some(&forkchoice_state) {
+                return;
+            }
         }
 
+        tracing::info!(
+            head = %forkchoice_state.head_block_hash,
+            safe = %forkchoice_state.safe_block_hash,
+            finalized = %forkchoice_state.finalized_block_hash,
+            "sending engine_forkchoiceUpdatedV3"
+        );
+
         match execution_engine
-            .engine_forkchoice_updated_v3(forkchoice_state, None)
+            .engine_forkchoice_updated_v3(forkchoice_state.clone(), None)
             .await
         {
             Ok(result) => {
+                let mut last_forkchoice = self.execution_forkchoice.lock().await;
                 *last_forkchoice = Some(forkchoice_state);
                 debug!(
                     "Forkchoice updated: execution engine reported {:?}",
                     result.payload_status.status
                 );
             }
-            Err(err) => warn!("Failed to update execution engine forkchoice: {err}"),
+            Err(err) => {
+                // Failure is non-fatal for consensus. Log and move on.
+                warn!("Failed to update execution engine forkchoice: {err}");
+            }
         }
     }
 
@@ -519,8 +532,6 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attester_slashing(&mut store, attester_slashing)?;
-        drop(store);
-        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
@@ -531,16 +542,12 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attestation(&mut store, attestation, is_from_block)?;
-        drop(store);
-        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
     pub async fn process_tick(&self, time: u64) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_tick(&mut store, time)?;
-        drop(store);
-        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 

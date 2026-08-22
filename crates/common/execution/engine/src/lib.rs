@@ -1,6 +1,6 @@
 pub mod utils;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use alloy_primitives::{Address, B64, B256, Bytes, U64, hex};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Filter, Log, TransactionRequest};
@@ -34,6 +34,7 @@ use reqwest::{Client, Request, Url};
 use serde_json::json;
 use ssz::Encode;
 use ssz_types::VariableList;
+use tokio::time::{sleep, timeout};
 use utils::{Claims, JsonRpcRequest, JsonRpcResponse, blob_versioned_hashes, strip_prefix};
 
 pub mod engine_trait;
@@ -41,6 +42,9 @@ pub mod mock_engine;
 pub mod new_payload_request;
 
 use crate::{engine_trait::ExecutionApi, new_payload_request::NewPayloadRequest};
+
+const FCU_TIMEOUT: Duration = Duration::from_secs(5); // Lighthouse uses 8s; 5s is fine for a testnet
+const FCU_MAX_RETRIES: u32 = 2;
 
 #[derive(Clone)]
 pub struct ExecutionEngine {
@@ -415,14 +419,39 @@ impl ExecutionEngine {
             params: vec![json!(forkchoice_state), json!(payload_attributes)],
         };
 
-        let http_post_request = self.build_request(request_body)?;
+        let mut last_err = None;
 
-        self.http_client
-            .execute(http_post_request)
-            .await?
-            .json::<JsonRpcResponse<ForkchoiceUpdateResult>>()
-            .await?
-            .to_result()
+        for attempt in 0..=FCU_MAX_RETRIES {
+            let http_post_request = self.build_request(request_body.clone())?;
+
+            let result = timeout(FCU_TIMEOUT, async {
+                self.http_client
+                    .execute(http_post_request)
+                    .await?
+                    .json::<JsonRpcResponse<ForkchoiceUpdateResult>>()
+                    .await?
+                    .to_result()
+            })
+            .await;
+
+            match result {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(e)) => {
+                    // EL returned a real error (INVALID, etc.) – do not retry
+                    tracing::warn!(?e, attempt, "engine_forkchoiceUpdatedV3 rejected by EL");
+                    return Err(e);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(attempt, "engine_forkchoiceUpdatedV3 timed out");
+                    last_err = Some(anyhow::anyhow!("engine_forkchoiceUpdatedV3 timed out"));
+                    if attempt < FCU_MAX_RETRIES {
+                        sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("engine_forkchoiceUpdatedV3 failed")))
     }
 }
 

@@ -16,7 +16,7 @@ pub fn strip_prefix(string: &str) -> &str {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct JsonRpcRequest {
     pub id: i32,
     pub jsonrpc: String,
