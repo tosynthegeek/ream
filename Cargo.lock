@@ -7122,6 +7122,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "lru",
+ "parking_lot",
  "ream-bls",
  "ream-consensus-beacon",
  "ream-consensus-lean",

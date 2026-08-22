@@ -544,7 +544,7 @@ async fn read_ssz_payload(payload: Payload) -> Result<actix_web::web::Bytes, Api
     Ok(body.freeze())
 }
 
-/// Publishes a validated block to the network and processes it
+/// Publishes a validated block to the network and processes it.
 async fn publish_and_process_block(
     signed_block: SignedBeaconBlock,
     beacon_chain: Data<Arc<BeaconChain>>,
@@ -578,30 +578,34 @@ async fn publish_and_process_block(
     )
     .await;
 
-    // Integrate into state (after broadcast)
-    let integration_success = match beacon_chain.process_block(signed_block.clone()).await {
-        Ok(BlockProcessingOutcome::Imported { .. }) => true,
-        Ok(BlockProcessingOutcome::PendingAvailability { block_root }) => {
-            warn!("Published block {block_root} is pending data availability");
-            false
-        }
-        Err(err) => {
-            if err.to_string().contains("already known")
-                || err.to_string().contains("ALREADY_KNOWN")
-            {
-                warn!("Block already known, ignoring: {err}");
-                return Ok(HttpResponse::Ok().finish());
+    // Integrate into our own state in the background, after the response has already gone
+    // out to the caller. The block has already been gossiped above, so this only affects
+    // when *our own* head catches up to the block we just proposed — it must not hold up
+    // the HTTP response the proposer's VC is waiting on.
+    let block_root = signed_block.message.tree_hash_root();
+    let import_chain = beacon_chain.get_ref().clone();
+    tokio::spawn(async move {
+        match import_chain.process_block(signed_block).await {
+            Ok(BlockProcessingOutcome::Imported { .. }) => {
+                info!("Self-imported published block {block_root}");
             }
-            error!("Failed to integrate block into state: {err}");
-            false
+            Ok(BlockProcessingOutcome::PendingAvailability { block_root }) => {
+                warn!("Published block {block_root} is pending data availability");
+            }
+            Err(err) => {
+                if err.to_string().contains("already known")
+                    || err.to_string().contains("ALREADY_KNOWN")
+                {
+                    warn!("Block already known, ignoring: {err}");
+                } else {
+                    error!("Failed to integrate published block {block_root} into state: {err}");
+                }
+            }
         }
-    };
+    });
 
-    if integration_success {
-        Ok(HttpResponse::Ok().finish())
-    } else {
-        Ok(HttpResponse::Accepted().finish())
-    }
+    // 202 Accepted: the block has been broadcast; local integration is still in flight.
+    Ok(HttpResponse::Accepted().finish())
 }
 
 fn build_and_store_data_column_sidecars(

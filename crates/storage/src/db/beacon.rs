@@ -1,6 +1,13 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use alloy_primitives::B256;
 use anyhow::anyhow;
+use parking_lot::RwLock;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
 use redb::{Database, ReadableDatabase};
@@ -27,11 +34,16 @@ use crate::{
     },
 };
 
+/// How long a cached head root is trusted before `Store::get_head` is required to
+/// recompute it from the DB again.
+pub const HEAD_CACHE_TTL: Duration = Duration::from_millis(300);
+
 #[derive(Clone, Debug)]
 pub struct BeaconDB {
     pub db: Arc<Database>,
     pub data_dir: PathBuf,
     pub(crate) cache: Option<Arc<BeaconCacheDB>>,
+    pub head_cache: Arc<RwLock<Option<(B256, Instant)>>>,
 }
 
 impl BeaconDB {
@@ -40,6 +52,28 @@ impl BeaconDB {
     pub fn with_cache(mut self, cache: Arc<BeaconCacheDB>) -> Self {
         self.cache = Some(cache);
         self
+    }
+
+    pub fn cached_head(&self) -> Option<B256> {
+        let (root, computed_at) = (*self.head_cache.read())?;
+        if computed_at.elapsed() < HEAD_CACHE_TTL {
+            Some(root)
+        } else {
+            None
+        }
+    }
+
+    /// Records a freshly computed head root, timestamped now.
+    pub fn set_cached_head(&self, root: B256) {
+        *self.head_cache.write() = Some((root, Instant::now()));
+    }
+
+    /// Forces the next `cached_head()` call to miss, e.g. immediately after a fork-choice-
+    /// relevant mutation (new block imported, new attesting weight, proposer boost reset,
+    /// justified/finalized checkpoint advanced) so the next reader is guaranteed to see an
+    /// up-to-date recomputation rather than a value that predates the change.
+    pub fn invalidate_cached_head(&self) {
+        *self.head_cache.write() = None;
     }
 
     pub fn block_provider(&self) -> BeaconBlockTable {

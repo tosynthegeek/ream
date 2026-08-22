@@ -165,6 +165,13 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     // Eagerly compute unrealized justification and finality.
     store.compute_pulled_up_tip(block_root)?;
 
+    // A newly imported block can change the LMD-GHOST head — most directly through the
+    // `proposer_boost_root` write above (which `update_checkpoints` does not cover), and
+    // more generally because a new block is itself a new fork-choice candidate. Force the
+    // next `get_head` call (by anyone sharing this DB) to recompute rather than return a
+    // value computed before this import.
+    store.db.invalidate_cached_head();
+
     Ok(())
 }
 
@@ -216,6 +223,10 @@ pub fn on_attester_slashing(
         .equivocating_indices_provider()
         .insert(equivocating)?;
 
+    // `get_weight` excludes equivocating indices from attestation weight, so marking new
+    // indices as equivocating can change `get_head`'s output.
+    store.db.invalidate_cached_head();
+
     Ok(())
 }
 
@@ -266,6 +277,10 @@ pub fn on_attestation(
     ensure!(target_state.is_valid_indexed_attestation(&indexed_attestation)?);
     // Update latest messages for attesting indices
     store.update_latest_messages(indexed_attestation.attesting_indices.to_vec(), attestation)?;
+
+    // New attesting weight can shift the LMD-GHOST head even without a new block, so the
+    // cached head root is no longer guaranteed current.
+    store.db.invalidate_cached_head();
 
     Ok(())
 }

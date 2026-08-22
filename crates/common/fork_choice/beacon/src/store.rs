@@ -221,7 +221,22 @@ impl Store {
         Ok(blocks)
     }
 
+    /// Returns the current LMD-GHOST head root.
     pub fn get_head(&self) -> anyhow::Result<B256> {
+        if let Some(cached) = self.db.cached_head() {
+            return Ok(cached);
+        }
+
+        let head = self.recompute_head()?;
+        self.db.set_cached_head(head);
+        Ok(head)
+    }
+
+    /// Runs the actual LMD-GHOST fork choice against the DB, with no caching. Callers that
+    /// need a guaranteed-fresh value (e.g. right after importing a block, where the caller
+    /// has already invalidated the cache) can call this directly; everyone else should go
+    /// through `get_head`.
+    fn recompute_head(&self) -> anyhow::Result<B256> {
         // Get filtered block tree that only includes viable branches
         let blocks = self.get_filtered_block_tree()?;
         // Execute the LMD-GHOST fork choice
@@ -274,6 +289,10 @@ impl Store {
                 .justified_checkpoint_provider()
                 .insert(justified_checkpoint)?;
             BEACON_CURRENT_JUSTIFIED_EPOCH.set(justified_checkpoint.epoch as i64);
+            // `get_filtered_block_tree`'s base root is the justified checkpoint root, so
+            // advancing it changes what `get_head` computes — a cached head from before this
+            // point is not just stale, it can be wrong relative to the new base.
+            self.db.invalidate_cached_head();
         }
 
         self.db
@@ -287,6 +306,7 @@ impl Store {
                 .finalized_checkpoint_provider()
                 .insert(finalized_checkpoint)?;
             BEACON_FINALIZED_EPOCH.set(finalized_checkpoint.epoch as i64);
+            self.db.invalidate_cached_head();
             // Clean operation pool
             if let Some(state) = self.db.state_provider().get(finalized_checkpoint.root)? {
                 self.operation_pool.clean_signed_voluntary_exits(&state);
@@ -644,6 +664,11 @@ impl Store {
         // If this is a new slot, reset store.proposer_boost_root
         if current_slot > previous_slot {
             self.db.proposer_boost_root_provider().insert(B256::ZERO)?;
+            // `get_weight` reads `proposer_boost_root` directly, so clearing it can change
+            // `get_head`'s output — this runs every slot, so it's the most frequent
+            // fork-choice-relevant mutation in the whole store, not just an epoch-boundary
+            // edge case.
+            self.db.invalidate_cached_head();
 
             // Clean old sync committee messages and contributions per slot
             self.sync_committee_pool

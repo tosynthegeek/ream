@@ -6,6 +6,7 @@ use std::{fs, io, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use beacon::BeaconDB;
 use lean::LeanDB;
+use parking_lot::RwLock;
 use redb::{Builder, Database};
 use tracing::info;
 
@@ -99,6 +100,7 @@ impl ReamDB {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
             cache: None,
+            head_cache: Arc::new(RwLock::new(None)),
         })
     }
 
