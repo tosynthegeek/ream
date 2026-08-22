@@ -10,11 +10,18 @@ use ream_storage::{
 };
 use tree_hash::TreeHash;
 
-use super::result::{DependencyValidationResult, ValidationResult};
+use super::result::DependencyValidationResult;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GossipValidatedBlock {
     block: Box<SignedBeaconBlock>,
+}
+
+enum BlockValidationOutcome {
+    Accept,
+    Ignore(String),
+    Reject(String),
+    DeferUnknownParent,
 }
 
 impl GossipValidatedBlock {
@@ -92,11 +99,17 @@ pub async fn validate_gossip_beacon_block(
     // signature before returning unknown-parent, as required by the gossip specification.
     let state = parent.as_ref().map_or(&head_state, |parent| &parent.state);
     match validate_beacon_block(beacon_chain, cached_db, block, state, parent.as_ref()).await? {
-        ValidationResult::Accept => {}
-        ValidationResult::Ignore(reason) => {
+        BlockValidationOutcome::Accept => {}
+        BlockValidationOutcome::DeferUnknownParent => {
+            return Ok(DependencyValidationResult::ParentPendingAvailability {
+                parent_root: block.message.parent_root,
+                validated: GossipValidatedBlock::new(block.clone()),
+            });
+        }
+        BlockValidationOutcome::Ignore(reason) => {
             return Ok(DependencyValidationResult::Ignore(reason));
         }
-        ValidationResult::Reject(reason) => {
+        BlockValidationOutcome::Reject(reason) => {
             return Ok(DependencyValidationResult::Reject(reason));
         }
     }
@@ -117,12 +130,12 @@ async fn validate_beacon_block(
     block: &SignedBeaconBlock,
     state: &BeaconState,
     parent: Option<&ParentContext>,
-) -> anyhow::Result<ValidationResult> {
+) -> anyhow::Result<BlockValidationOutcome> {
     let store = beacon_chain.store.lock().await;
 
     // [IGNORE] The block is not from a future slot.
     if block.message.slot > store.get_current_slot()? {
-        return Ok(ValidationResult::Ignore(
+        return Ok(BlockValidationOutcome::Ignore(
             "Block is from a future slot".to_string(),
         ));
     }
@@ -130,13 +143,15 @@ async fn validate_beacon_block(
     // [IGNORE] The block is from a slot greater than the latest finalized slot.
     let finalized_checkpoint = store.db.finalized_checkpoint_provider().get()?;
     if block.message.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
-        return Ok(ValidationResult::Ignore(
+        return Ok(BlockValidationOutcome::Ignore(
             "Block is not from a slot greater than the latest finalized slot".to_string(),
         ));
     }
 
     let Some(validator) = state.validators.get(block.message.proposer_index as usize) else {
-        return Ok(ValidationResult::Reject("Validator not found".to_string()));
+        return Ok(BlockValidationOutcome::Reject(
+            "Validator not found".to_string(),
+        ));
     };
 
     // [IGNORE] The block is the first block with valid signature received for the proposer for the
@@ -150,7 +165,7 @@ async fn validate_beacon_block(
             slot: block.message.slot,
         })
     {
-        return Ok(ValidationResult::Ignore(
+        return Ok(BlockValidationOutcome::Ignore(
             "Signature already received".to_string(),
         ));
     }
@@ -159,26 +174,24 @@ async fn validate_beacon_block(
     match state.verify_block_header_signature(&block.signed_header()) {
         Ok(true) => {}
         Ok(false) => {
-            return Ok(ValidationResult::Reject("Invalid signature".to_string()));
+            return Ok(BlockValidationOutcome::Reject(
+                "Invalid signature".to_string(),
+            ));
         }
         Err(err) => {
-            return Ok(ValidationResult::Reject(format!(
+            return Ok(BlockValidationOutcome::Reject(format!(
                 "Signature verification failed: {err}"
             )));
         }
     }
 
     let Some(parent) = parent else {
-        // Unknown-parent lookup is intentionally deferred to #1532. A parent held only by the
-        // coordinator has no post-state with which to validate a grandchild.
-        return Ok(ValidationResult::Ignore(
-            "Parent block not found".to_string(),
-        ));
+        return Ok(BlockValidationOutcome::DeferUnknownParent);
     };
 
     // [REJECT] The block is from a higher slot than its parent.
     if block.message.slot <= parent.block.message.slot {
-        return Ok(ValidationResult::Reject(
+        return Ok(BlockValidationOutcome::Reject(
             "Block is not from a higher slot".to_string(),
         ));
     }
@@ -188,7 +201,7 @@ async fn validate_beacon_block(
         && store.get_checkpoint_block(block.message.parent_root, finalized_checkpoint.epoch)?
             != finalized_checkpoint.root
     {
-        return Ok(ValidationResult::Reject(
+        return Ok(BlockValidationOutcome::Reject(
             "Finalized checkpoint is not an ancestor".to_string(),
         ));
     }
@@ -201,14 +214,14 @@ async fn validate_beacon_block(
     drop(store);
     let mut state = state.clone();
     if let Err(err) = state.process_slots(block.message.slot) {
-        return Ok(ValidationResult::Ignore(format!(
+        return Ok(BlockValidationOutcome::Ignore(format!(
             "Could not advance parent state to block slot: {err:?}"
         )));
     }
 
     // [REJECT] The block is proposed by the expected proposer_index for the block's slot.
     if state.get_beacon_proposer_index(None)? != block.message.proposer_index {
-        return Ok(ValidationResult::Reject(
+        return Ok(BlockValidationOutcome::Reject(
             "Proposer index is incorrect".to_string(),
         ));
     }
@@ -217,7 +230,7 @@ async fn validate_beacon_block(
     if block.message.body.execution_payload.timestamp
         != state.compute_timestamp_at_slot(block.message.slot)
     {
-        return Ok(ValidationResult::Reject(
+        return Ok(BlockValidationOutcome::Reject(
             "Execution payload timestamp is incorrect".to_string(),
         ));
     }
@@ -228,7 +241,7 @@ async fn validate_beacon_block(
             .validators
             .get(signed_bls_execution_change.message.validator_index as usize)
         else {
-            return Ok(ValidationResult::Reject(
+            return Ok(BlockValidationOutcome::Reject(
                 "BLS to execution change validator not found".to_string(),
             ));
         };
@@ -241,7 +254,7 @@ async fn validate_beacon_block(
                 slot: block.message.slot,
             })
         {
-            return Ok(ValidationResult::Ignore(
+            return Ok(BlockValidationOutcome::Ignore(
                 "BLS to execution change already received".to_string(),
             ));
         }
@@ -253,7 +266,7 @@ async fn validate_beacon_block(
             .validate_bls_to_execution_change(signed_bls_execution_change)
             .is_err()
         {
-            return Ok(ValidationResult::Reject(
+            return Ok(BlockValidationOutcome::Reject(
                 "BLS to execution change is invalid".to_string(),
             ));
         }
@@ -261,7 +274,7 @@ async fn validate_beacon_block(
 
     // [REJECT] The length of KZG commitments is less than or equal to the limitation.
     if block.message.body.blob_kzg_commitments.len() > MAX_BLOBS_PER_BLOCK_ELECTRA as usize {
-        return Ok(ValidationResult::Reject(
+        return Ok(BlockValidationOutcome::Reject(
             "Length of KZG commitments is greater than the limit".to_string(),
         ));
     }
@@ -274,7 +287,7 @@ async fn validate_beacon_block(
     };
     let mut seen_proposer_signatures = cached_db.seen_proposer_signature.write().await;
     if seen_proposer_signatures.contains(&proposer_slot) {
-        return Ok(ValidationResult::Ignore(
+        return Ok(BlockValidationOutcome::Ignore(
             "Signature already received".to_string(),
         ));
     }
@@ -293,5 +306,5 @@ async fn validate_beacon_block(
         );
     }
 
-    Ok(ValidationResult::Accept)
+    Ok(BlockValidationOutcome::Accept)
 }

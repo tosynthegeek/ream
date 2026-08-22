@@ -101,6 +101,7 @@ pub fn insert_pending_item(
                 block_root: signed_block.message.tree_hash_root(),
                 parent_root: signed_block.message.parent_root,
                 slot: signed_block.message.slot,
+                proposer_index: signed_block.message.proposer_index,
             };
             coordinator.insert_pending_block(meta, block, current_slot)
         }
@@ -335,6 +336,17 @@ pub fn log_insert_outcome(block_root: B256, outcome: InsertOutcome) {
         InsertOutcome::Inserted => {}
         InsertOutcome::Duplicate => {
             debug!(?block_root, "Ignored duplicate pending block lookup data");
+        }
+        InsertOutcome::Rejected(InsertError::ProposerPendingLimitExceeded {
+            proposer_index,
+            limit,
+        }) => {
+            warn!(
+                ?block_root,
+                proposer_index,
+                limit,
+                "Rejected pending block: proposer already at pending-entry limit"
+            );
         }
         InsertOutcome::Rejected(reason) => {
             warn!(?block_root, ?reason, "Rejected pending block insertion");

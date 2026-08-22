@@ -16,9 +16,12 @@ pub const DEFAULT_MAX_PENDING_ENTRIES: usize = 160;
 /// Lighthouse.
 pub const DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15 * SLOTS_PER_EPOCH);
 
+pub const DEFAULT_MAX_PENDING_PER_PROPOSER: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockLookupConfig {
     pub max_pending_entries: usize,
+    pub max_pending_per_proposer: usize,
     pub data_column_retention_epochs: u64,
     pub no_progress_timeout: Duration,
 }
@@ -27,6 +30,7 @@ impl BlockLookupConfig {
     pub fn for_data_column_retention(retention_epochs: u64) -> Self {
         Self {
             max_pending_entries: DEFAULT_MAX_PENDING_ENTRIES,
+            max_pending_per_proposer: DEFAULT_MAX_PENDING_PER_PROPOSER,
             data_column_retention_epochs: retention_epochs,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
@@ -41,6 +45,7 @@ pub struct PendingBlockMeta {
     pub block_root: B256,
     pub parent_root: B256,
     pub slot: u64,
+    pub proposer_index: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +63,10 @@ pub enum InsertError {
         retention_epochs: u64,
     },
     CapacityUnavailable,
+    ProposerPendingLimitExceeded {
+        proposer_index: u64,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +174,7 @@ pub struct BlockLookupCoordinator<BlockPayload, ColumnPayload> {
     pending_actions: VecDeque<PendingAction>,
     /// Monotonic identifier used to ignore stale worker results.
     next_action_id: u64,
+    pending_count_by_proposer: HashMap<u64, usize>,
 }
 
 impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPayload> {
@@ -175,6 +185,7 @@ impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPay
             children_by_parent: HashMap::new(),
             pending_actions: VecDeque::new(),
             next_action_id: 0,
+            pending_count_by_proposer: HashMap::new(),
         }
     }
 
@@ -199,6 +210,17 @@ impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPay
                 retention_epochs: self.config.data_column_retention_epochs,
             });
         }
+        let proposer_pending_count = self
+            .pending_count_by_proposer
+            .get(&meta.proposer_index)
+            .copied()
+            .unwrap_or(0);
+        if proposer_pending_count >= self.config.max_pending_per_proposer {
+            return InsertOutcome::Rejected(InsertError::ProposerPendingLimitExceeded {
+                proposer_index: meta.proposer_index,
+                limit: self.config.max_pending_per_proposer,
+            });
+        }
 
         if !self.entries.contains_key(&meta.block_root) {
             if let Err(err) = self.ensure_capacity() {
@@ -221,6 +243,10 @@ impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPay
             payload: Some(payload),
             action_state: ActionState::Waiting,
         });
+        *self
+            .pending_count_by_proposer
+            .entry(meta.proposer_index)
+            .or_insert(0) += 1;
         InsertOutcome::Inserted
     }
 
@@ -606,12 +632,22 @@ impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPay
             PendingAction::ImportBlock(root) => *root != block_root,
             PendingAction::ImportColumn(identifier) => identifier.block_root != block_root,
         });
-        if let Some(block) = entry.block
-            && let Some(children) = self.children_by_parent.get_mut(&block.meta.parent_root)
-        {
-            children.retain(|child| *child != block_root);
-            if children.is_empty() {
-                self.children_by_parent.remove(&block.meta.parent_root);
+        if let Some(block) = entry.block {
+            if let Some(children) = self.children_by_parent.get_mut(&block.meta.parent_root) {
+                children.retain(|child| *child != block_root);
+                if children.is_empty() {
+                    self.children_by_parent.remove(&block.meta.parent_root);
+                }
+            }
+            if let Some(count) = self
+                .pending_count_by_proposer
+                .get_mut(&block.meta.proposer_index)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_count_by_proposer
+                        .remove(&block.meta.proposer_index);
+                }
             }
         }
     }
@@ -624,6 +660,7 @@ mod tests {
     fn config() -> BlockLookupConfig {
         BlockLookupConfig {
             max_pending_entries: 32,
+            max_pending_per_proposer: DEFAULT_MAX_PENDING_PER_PROPOSER,
             data_column_retention_epochs: 2,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
@@ -634,6 +671,7 @@ mod tests {
             block_root: B256::repeat_byte(root),
             parent_root: B256::repeat_byte(parent),
             slot,
+            proposer_index: root as u64,
         }
     }
 
