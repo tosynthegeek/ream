@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
@@ -131,6 +133,34 @@ async fn validate_beacon_block(
     state: &BeaconState,
     parent: Option<&ParentContext>,
 ) -> anyhow::Result<BlockValidationOutcome> {
+    // DIAGNOSTIC: validate_gossip_beacon_block itself showed up taking as long as ~6.9s on a
+    // single block. This function is where the actual per-block cost lives (signature
+    // verification, state advancement, proposer index / shuffling computation, ancestry walk) —
+    // timing each step separately here, alongside the already-instrumented `store.get_head()`
+    // cache-miss logging, should show whether it's this function or the store lookups around it
+    // that dominates, and if it's this function, which specific step.
+    let overall_start = Instant::now();
+    macro_rules! log_step {
+        ($label:expr, $start:expr) => {{
+            let elapsed = $start.elapsed();
+            if elapsed > Duration::from_millis(200) {
+                tracing::warn!(
+                    step = $label,
+                    ?elapsed,
+                    slot = block.message.slot,
+                    "validate_beacon_block step was slow"
+                );
+            } else {
+                tracing::debug!(
+                    step = $label,
+                    ?elapsed,
+                    slot = block.message.slot,
+                    "validate_beacon_block step finished"
+                );
+            }
+        }};
+    }
+
     let store = beacon_chain.store.lock().await;
 
     // [IGNORE] The block is not from a future slot.
@@ -171,7 +201,10 @@ async fn validate_beacon_block(
     }
 
     // [REJECT] The proposer signature is valid with respect to the proposer_index pubkey.
-    match state.verify_block_header_signature(&block.signed_header()) {
+    let signature_start = Instant::now();
+    let signature_result = state.verify_block_header_signature(&block.signed_header());
+    log_step!("verify_block_header_signature", signature_start);
+    match signature_result {
         Ok(true) => {}
         Ok(false) => {
             return Ok(BlockValidationOutcome::Reject(
@@ -197,13 +230,17 @@ async fn validate_beacon_block(
     }
 
     #[cfg(not(feature = "disable_ancestor_validation"))]
-    if !parent.pending_availability
-        && store.get_checkpoint_block(block.message.parent_root, finalized_checkpoint.epoch)?
-            != finalized_checkpoint.root
-    {
-        return Ok(BlockValidationOutcome::Reject(
-            "Finalized checkpoint is not an ancestor".to_string(),
-        ));
+    if !parent.pending_availability {
+        let ancestry_start = Instant::now();
+        let ancestor_ok = store
+            .get_checkpoint_block(block.message.parent_root, finalized_checkpoint.epoch)?
+            == finalized_checkpoint.root;
+        log_step!("get_checkpoint_block_ancestry_walk", ancestry_start);
+        if !ancestor_ok {
+            return Ok(BlockValidationOutcome::Reject(
+                "Finalized checkpoint is not an ancestor".to_string(),
+            ));
+        }
     }
 
     // A pending parent is not in the block DB, so an ancestry walk cannot cross it. At arrival we
@@ -213,14 +250,20 @@ async fn validate_beacon_block(
     // State advancement and cache access do not require exclusive access to the store.
     drop(store);
     let mut state = state.clone();
-    if let Err(err) = state.process_slots(block.message.slot) {
+    let process_slots_start = Instant::now();
+    let process_slots_result = state.process_slots(block.message.slot);
+    log_step!("process_slots", process_slots_start);
+    if let Err(err) = process_slots_result {
         return Ok(BlockValidationOutcome::Ignore(format!(
             "Could not advance parent state to block slot: {err:?}"
         )));
     }
 
     // [REJECT] The block is proposed by the expected proposer_index for the block's slot.
-    if state.get_beacon_proposer_index(None)? != block.message.proposer_index {
+    let proposer_index_start = Instant::now();
+    let proposer_index_result = state.get_beacon_proposer_index(None);
+    log_step!("get_beacon_proposer_index", proposer_index_start);
+    if proposer_index_result? != block.message.proposer_index {
         return Ok(BlockValidationOutcome::Reject(
             "Proposer index is incorrect".to_string(),
         ));
@@ -306,5 +349,6 @@ async fn validate_beacon_block(
         );
     }
 
+    log_step!("validate_beacon_block_total", overall_start);
     Ok(BlockValidationOutcome::Accept)
 }

@@ -630,7 +630,9 @@ impl NetworkManagerService {
                                     &mut block_lookup_coordinator,
                                     item,
                                     cached_current_slot,
-                                ),
+                                    &beacon_chain,
+                                )
+                                .await,
                             );
                         }
                         None => {}

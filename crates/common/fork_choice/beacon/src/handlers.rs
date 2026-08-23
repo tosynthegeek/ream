@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, ensure};
 use ream_consensus_beacon::{
@@ -242,13 +244,37 @@ pub fn on_tick(store: &mut Store, time: u64) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // DIAGNOSTIC: this runs synchronously while the caller holds `store.lock().await`,
+    // and it's called once per incoming block gossip message (via process_tick) before
+    // that block is even validated. If the node has fallen behind, `tick_slot -
+    // current_slot` can be > 1, meaning this loop does multiple catch-up iterations of
+    // on_tick_per_slot back-to-back, under the lock, once per incoming block. Logging
+    // the catch-up count and total time here will show whether this is a real
+    // contributor to the block-validation stall, separate from any single call being
+    // slow.
+    let tick_start = Instant::now();
+    let start_slot = store.get_current_slot()?;
+
     let tick_slot = (time - genesis_time) / beacon_network_spec().seconds_per_slot();
+    let mut catchup_iterations = 0u64;
     while store.get_current_slot()? < tick_slot {
         let previous_time = store.db.genesis_time_provider().get()?
             + (store.get_current_slot()? + 1) * beacon_network_spec().seconds_per_slot();
         store.on_tick_per_slot(previous_time)?;
+        catchup_iterations += 1;
     }
     store.on_tick_per_slot(time)?;
+
+    let elapsed = tick_start.elapsed();
+    if catchup_iterations > 1 || elapsed > std::time::Duration::from_millis(500) {
+        tracing::warn!(
+            start_slot,
+            tick_slot,
+            catchup_iterations,
+            ?elapsed,
+            "on_tick did multi-slot catch-up or ran slow, under the store lock"
+        );
+    }
 
     Ok(())
 }

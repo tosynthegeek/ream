@@ -46,6 +46,14 @@ use crate::{engine_trait::ExecutionApi, new_payload_request::NewPayloadRequest};
 const FCU_TIMEOUT: Duration = Duration::from_secs(5); // Lighthouse uses 8s; 5s is fine for a testnet
 const FCU_MAX_RETRIES: u32 = 2;
 
+// DIAGNOSTIC: engine_newPayload was never wrapped in a timeout, unlike FCU above.
+// This is instrumentation to find out whether it's the thing hanging during the
+// second-stage stall (block gossip validation never completing). Values are
+// intentionally generous (newPayload can legitimately take longer than FCU on a
+// big block) — the goal right now is visibility, not tuning.
+const NEW_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+const NEW_PAYLOAD_MAX_RETRIES: u32 = 1;
+
 #[derive(Clone)]
 pub struct ExecutionEngine {
     http_client: Client,
@@ -385,6 +393,9 @@ impl ExecutionEngine {
         parent_beacon_block_root: B256,
         execution_requests: Vec<Bytes>,
     ) -> anyhow::Result<PayloadStatusV1> {
+        let block_hash = execution_payload.block_hash;
+        let block_number = execution_payload.block_number;
+
         let request_body = JsonRpcRequest {
             id: 1,
             jsonrpc: "2.0".to_string(),
@@ -397,14 +408,64 @@ impl ExecutionEngine {
             ],
         };
 
-        let http_post_request = self.build_request(request_body)?;
+        // DIAGNOSTIC: mirrors the FCU timeout/retry pattern below, purely to find out
+        // whether this call is what's hanging. If block validation goes silent again,
+        // check for "sending engine_newPayloadV4" with no matching "finished" or a
+        // "timed out" line for this block_number — that confirms this call as the cause.
+        let mut last_err = None;
 
-        self.http_client
-            .execute(http_post_request)
-            .await?
-            .json::<JsonRpcResponse<PayloadStatusV1>>()
-            .await?
-            .to_result()
+        for attempt in 0..=NEW_PAYLOAD_MAX_RETRIES {
+            tracing::info!(
+                %block_hash,
+                block_number,
+                attempt,
+                "sending engine_newPayloadV4"
+            );
+            let call_start = std::time::Instant::now();
+            let http_post_request = self.build_request(request_body.clone())?;
+
+            let result = timeout(NEW_PAYLOAD_TIMEOUT, async {
+                self.http_client
+                    .execute(http_post_request)
+                    .await?
+                    .json::<JsonRpcResponse<PayloadStatusV1>>()
+                    .await?
+                    .to_result()
+            })
+            .await;
+
+            match result {
+                Ok(Ok(response)) => {
+                    tracing::info!(
+                        %block_hash,
+                        block_number,
+                        attempt,
+                        elapsed = ?call_start.elapsed(),
+                        "engine_newPayloadV4 finished"
+                    );
+                    return Ok(response);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(?e, %block_hash, block_number, attempt, "engine_newPayloadV4 rejected by EL");
+                    return Err(e);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        %block_hash,
+                        block_number,
+                        attempt,
+                        waited = ?call_start.elapsed(),
+                        "engine_newPayloadV4 timed out"
+                    );
+                    last_err = Some(anyhow::anyhow!("engine_newPayloadV4 timed out"));
+                    if attempt < NEW_PAYLOAD_MAX_RETRIES {
+                        sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("engine_newPayloadV4 failed")))
     }
 
     pub async fn engine_forkchoice_updated_v3(

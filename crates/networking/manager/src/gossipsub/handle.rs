@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
@@ -232,11 +232,32 @@ pub async fn handle_gossipsub_message(
                         .expect("System time is before UNIX epoch");
                     duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
                 };
+
+                // DIAGNOSTIC: process_tick and validate_gossip_beacon_block are the only
+                // two async calls between "Beacon block received over gossipsub" and this
+                // block ever reaching "queue block for import". If block gossip validation
+                // goes silent again, whichever of these two logs a "start" without a
+                // matching "done" is the one to dig into next.
+                let tick_start = Instant::now();
+                info!(
+                    block_slot = %signed_block.message.slot,
+                    "process_tick start (pre block validation)"
+                );
                 if let Err(err) = beacon_chain.process_tick(tick_time).await {
                     warn!("Failed to process gossipsub tick before block validation: {err}");
                     return (MessageAcceptance::Ignore, None);
                 }
+                info!(
+                    block_slot = %signed_block.message.slot,
+                    elapsed = ?tick_start.elapsed(),
+                    "process_tick done (pre block validation)"
+                );
 
+                let validate_start = Instant::now();
+                info!(
+                    block_slot = %signed_block.message.slot,
+                    "validate_gossip_beacon_block start"
+                );
                 let validation_result = match validate_gossip_beacon_block(
                     beacon_chain,
                     cached_db,
@@ -250,6 +271,11 @@ pub async fn handle_gossipsub_message(
                         return (MessageAcceptance::Ignore, None);
                     }
                 };
+                info!(
+                    block_slot = %signed_block.message.slot,
+                    elapsed = ?validate_start.elapsed(),
+                    "validate_gossip_beacon_block done"
+                );
 
                 let acceptance = dependency_message_acceptance(&validation_result);
                 let work = match validation_result {

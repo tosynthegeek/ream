@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{B256, map::HashSet};
 use anyhow::{anyhow, bail, ensure};
@@ -227,7 +231,35 @@ impl Store {
             return Ok(cached);
         }
 
-        let head = self.recompute_head()?;
+        // DIAGNOSTIC: this is the cache-miss path, hit once per slot right after
+        // `on_tick_per_slot` calls `invalidate_cached_head()` (and by whichever caller happens
+        // to ask for the head first afterward — `validate_gossip_beacon_block` calls
+        // `store.get_head()` unconditionally for every incoming block, so it's frequently this
+        // caller that pays the cost). `recompute_head` walks the filtered block tree from the
+        // justified checkpoint, which is never pruned while finality is stuck — so its cost
+        // should scale with however many blocks have been imported since the last justified
+        // checkpoint. Logging elapsed alongside the tree size it actually walked (not a second,
+        // separate walk) directly tests that: if elapsed grows in step with tree size over a
+        // run, this is the (or a) real bottleneck; if it stays flat while tree size grows, look
+        // elsewhere.
+        let start = Instant::now();
+        let (head, tree_size) = self.recompute_head()?;
+        let elapsed = start.elapsed();
+        if elapsed > Duration::from_millis(200) {
+            tracing::warn!(
+                ?elapsed,
+                tree_size,
+                ?head,
+                "get_head cache miss: recompute_head was slow"
+            );
+        } else {
+            tracing::debug!(
+                ?elapsed,
+                tree_size,
+                "get_head cache miss: recompute_head finished"
+            );
+        }
+
         self.db.set_cached_head(head);
         Ok(head)
     }
@@ -235,10 +267,12 @@ impl Store {
     /// Runs the actual LMD-GHOST fork choice against the DB, with no caching. Callers that
     /// need a guaranteed-fresh value (e.g. right after importing a block, where the caller
     /// has already invalidated the cache) can call this directly; everyone else should go
-    /// through `get_head`.
-    fn recompute_head(&self) -> anyhow::Result<B256> {
+    /// through `get_head`. Returns the head plus the size of the filtered block tree it walked,
+    /// purely for the diagnostic logging in `get_head` above — not used for anything else.
+    fn recompute_head(&self) -> anyhow::Result<(B256, usize)> {
         // Get filtered block tree that only includes viable branches
         let blocks = self.get_filtered_block_tree()?;
+        let tree_size = blocks.len();
         // Execute the LMD-GHOST fork choice
         let mut head = self.db.justified_checkpoint_provider().get()?.root;
 
@@ -251,7 +285,7 @@ impl Store {
             }
 
             if children.is_empty() {
-                return Ok(head);
+                return Ok((head, tree_size));
             }
 
             let mut weighted_children = children
@@ -661,20 +695,46 @@ impl Store {
 
         let current_slot = self.get_current_slot()?;
 
+        // DIAGNOSTIC: on_tick_per_slot showed up taking as long as ~2.4s in a single call, and
+        // this whole function runs under the store lock (called from `on_tick`, called from
+        // `process_tick`, called from the block-gossip validation path — so it directly gates
+        // block validation throughput). Timing each sub-step separately, rather than just the
+        // function as a whole, is the point: it tells us which one actually dominates instead of
+        // leaving it as one lump sum.
+        let step_timer = Instant::now();
+        let mut step_elapsed: Vec<(&'static str, Duration)> = Vec::new();
+        macro_rules! timed_step {
+            ($label:expr, $body:expr) => {{
+                let t = Instant::now();
+                let result = $body;
+                step_elapsed.push(($label, t.elapsed()));
+                result
+            }};
+        }
+
         // If this is a new slot, reset store.proposer_boost_root
         if current_slot > previous_slot {
-            self.db.proposer_boost_root_provider().insert(B256::ZERO)?;
+            timed_step!(
+                "proposer_boost_root_reset",
+                self.db.proposer_boost_root_provider().insert(B256::ZERO)
+            )?;
             // `get_weight` reads `proposer_boost_root` directly, so clearing it can change
             // `get_head`'s output — this runs every slot, so it's the most frequent
             // fork-choice-relevant mutation in the whole store, not just an epoch-boundary
             // edge case.
-            self.db.invalidate_cached_head();
+            timed_step!("invalidate_cached_head", self.db.invalidate_cached_head());
 
             // Clean old sync committee messages and contributions per slot
-            self.sync_committee_pool
-                .clean_sync_committee_messages(current_slot);
-            self.sync_committee_pool
-                .clean_sync_committee_contributions(current_slot);
+            timed_step!(
+                "clean_sync_committee_messages",
+                self.sync_committee_pool
+                    .clean_sync_committee_messages(current_slot)
+            );
+            timed_step!(
+                "clean_sync_committee_contributions",
+                self.sync_committee_pool
+                    .clean_sync_committee_contributions(current_slot)
+            );
 
             // A finalized checkpoint only finalizes the checkpoint slot, not every block in its
             // epoch. Keep pending blocks from later slots in that epoch while pruning entries at
@@ -684,45 +744,75 @@ impl Store {
                 self.get_current_store_epoch()?,
                 beacon_network_spec().min_epochs_for_data_column_sidecars_requests,
             );
-            let pruned_availability = self.data_availability_checker.prune(cutoff_slot);
+            let pruned_availability = timed_step!(
+                "data_availability_checker_prune",
+                self.data_availability_checker.prune(cutoff_slot)
+            );
             if pruned_availability > 0 {
                 debug!("Pruned {pruned_availability} stale pending availability entries");
             }
 
             // Drop attestations that have aged out of the inclusion window (nothing else prunes
             // them, and they can never be included again).
-            self.operation_pool
-                .clean_attestations(compute_epoch_at_slot(current_slot));
+            timed_step!(
+                "clean_attestations",
+                self.operation_pool
+                    .clean_attestations(compute_epoch_at_slot(current_slot))
+            );
         }
 
         // If a new epoch, pull-up justification and finalization from previous epoch
         if current_slot > previous_slot && compute_slots_since_epoch_start(current_slot) == 0 {
-            match self.get_head() {
-                Ok(head) => {
-                    if let Some(state) = self.db.state_provider().get(head)? {
-                        let active_count = state
-                            .get_active_validator_indices(state.get_current_epoch())
-                            .len();
-                        BEACON_CURRENT_ACTIVE_VALIDATORS.set(active_count as i64);
-                    } else {
-                        tracing::warn!("Could not find head state for active validators metric");
+            timed_step!("epoch_boundary_head_and_checkpoints", {
+                match self.get_head() {
+                    Ok(head) => {
+                        if let Some(state) = self.db.state_provider().get(head)? {
+                            let active_count = state
+                                .get_active_validator_indices(state.get_current_epoch())
+                                .len();
+                            BEACON_CURRENT_ACTIVE_VALIDATORS.set(active_count as i64);
+                        } else {
+                            tracing::warn!(
+                                "Could not find head state for active validators metric"
+                            );
+                        }
                     }
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to get head for active validators metric: {err:?}");
-                }
-            };
+                    Err(err) => {
+                        tracing::warn!("Failed to get head for active validators metric: {err:?}");
+                    }
+                };
 
-            let unrealized_justified = self.db.unrealized_justified_checkpoint_provider().get()?;
-            let unrealized_finalized = self.db.unrealized_finalized_checkpoint_provider().get()?;
+                let unrealized_justified =
+                    self.db.unrealized_justified_checkpoint_provider().get()?;
+                let unrealized_finalized =
+                    self.db.unrealized_finalized_checkpoint_provider().get()?;
 
-            // On epoch boundary, previous_justified becomes what was previously current justified
-            let previous_justified = self.db.justified_checkpoint_provider().get()?;
-            self.update_checkpoints(
-                unrealized_justified,
-                unrealized_finalized,
-                previous_justified,
-            )?;
+                // On epoch boundary, previous_justified becomes what was previously current
+                // justified
+                let previous_justified = self.db.justified_checkpoint_provider().get()?;
+                self.update_checkpoints(
+                    unrealized_justified,
+                    unrealized_finalized,
+                    previous_justified,
+                )
+            })?;
+        }
+
+        let total_elapsed = step_timer.elapsed();
+        if total_elapsed > Duration::from_millis(500) {
+            tracing::warn!(
+                ?total_elapsed,
+                slot = current_slot,
+                steps = ?step_elapsed,
+                "on_tick_per_slot was slow"
+            );
+        } else {
+            tracing::debug!(
+                ?total_elapsed,
+                slot = current_slot,
+                steps = ?step_elapsed,
+                "on_tick_per_slot finished"
+            );
         }
 
         Ok(())

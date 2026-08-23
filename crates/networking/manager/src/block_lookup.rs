@@ -89,21 +89,37 @@ pub enum CoordinatorUpdate {
     },
 }
 
-pub fn insert_pending_item(
+pub async fn insert_pending_item(
     coordinator: &mut BlockLookupCoordinator,
     item: PendingGossipItem,
     current_slot: u64,
+    beacon_chain: &BeaconChain,
 ) -> InsertOutcome {
     match item {
         PendingGossipItem::Block { block } => {
             let signed_block = block.block();
+            let parent_root = signed_block.message.parent_root;
             let meta = PendingBlockMeta {
                 block_root: signed_block.message.tree_hash_root(),
-                parent_root: signed_block.message.parent_root,
+                parent_root,
                 slot: signed_block.message.slot,
                 proposer_index: signed_block.message.proposer_index,
             };
-            coordinator.insert_pending_block(meta, block, current_slot)
+            let outcome = coordinator.insert_pending_block(meta, block, current_slot);
+
+            if matches!(outcome, InsertOutcome::Inserted)
+                && parent_is_already_imported(beacon_chain, parent_root).await
+            {
+                debug!(
+                    ?parent_root,
+                    "Parent for newly-inserted pending block was already imported; \
+                     releasing immediately instead of waiting for a BlockImportEvent \
+                     that already fired"
+                );
+                coordinator.parent_imported(parent_root);
+            }
+
+            outcome
         }
         PendingGossipItem::Column { column } => {
             let sidecar = column.sidecar();
@@ -115,6 +131,17 @@ pub fn insert_pending_item(
             coordinator.insert_pending_column(meta, column, current_slot)
         }
     }
+}
+
+/// Best-effort check of whether `parent_root` is already fully imported (block + state both
+/// present). Errors are treated as "not known yet" — this is only ever used to decide whether to
+/// take the fast path of releasing immediately; if it's wrong in that direction, the item still
+/// gets released normally whenever the next real `parent_imported` event for it arrives, so
+/// there's no correctness cost to being conservative here.
+async fn parent_is_already_imported(beacon_chain: &BeaconChain, parent_root: B256) -> bool {
+    let store = beacon_chain.store.lock().await;
+    matches!(store.db.block_provider().get(parent_root), Ok(Some(_)))
+        && matches!(store.db.state_provider().get(parent_root), Ok(Some(_)))
 }
 
 pub fn apply_coordinator_update(

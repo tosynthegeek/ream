@@ -256,11 +256,15 @@ impl GossipLookupHarness {
                         .await
                         .get_current_slot()
                         .expect("current slot should be available");
-                    outcomes.push(insert_pending_item(
-                        &mut self.coordinator,
-                        item,
-                        current_slot,
-                    ));
+                    outcomes.push(
+                        insert_pending_item(
+                            &mut self.coordinator,
+                            item,
+                            current_slot,
+                            &self.beacon_chain,
+                        )
+                        .await,
+                    );
                 }
                 _ => {}
             }
