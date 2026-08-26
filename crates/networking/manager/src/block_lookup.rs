@@ -262,7 +262,7 @@ async fn ensure_pending_item_is_importable(
     ensure_pending_item_is_importable_with_store(&store, slot, parent_root, data_column_block_root)
 }
 
-fn ensure_pending_item_is_importable_with_store(
+pub(crate) fn ensure_pending_item_is_importable_with_store(
     store: &Store,
     slot: u64,
     parent_root: B256,

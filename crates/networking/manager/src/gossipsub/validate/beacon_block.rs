@@ -44,18 +44,23 @@ pub async fn validate_gossip_beacon_block(
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
-    let (head_state, parent) = {
+    let parent = {
         let store = beacon_chain.store.lock().await;
-        let head_root = store.get_head()?;
-        let head_state = store
-            .db
-            .state_provider()
-            .get(head_root)?
-            .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
 
-        let parent = if let Some(parent_block) =
-            store.db.block_provider().get(block.message.parent_root)?
-        {
+        if block.message.slot > store.get_current_slot()? {
+            return Ok(DependencyValidationResult::Ignore(
+                "Block is from a future slot".to_string(),
+            ));
+        }
+
+        let finalized_checkpoint = store.db.finalized_checkpoint_provider().get()?;
+        if block.message.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
+            return Ok(DependencyValidationResult::Ignore(
+                "Block is not from a slot greater than the latest finalized slot".to_string(),
+            ));
+        }
+
+        if let Some(parent_block) = store.db.block_provider().get(block.message.parent_root)? {
             let Some(parent_state) = store.db.state_provider().get(block.message.parent_root)?
             else {
                 return Err(anyhow!(
@@ -84,14 +89,17 @@ pub async fn validate_gossip_beacon_block(
             })
         } else {
             None
-        };
-        (head_state, parent)
+        }
     };
 
-    // Looking up the parent above does not classify the message. Validation still checks the
-    // signature before returning unknown-parent, as required by the gossip specification.
-    let state = parent.as_ref().map_or(&head_state, |parent| &parent.state);
-    match validate_beacon_block(beacon_chain, cached_db, block, state, parent.as_ref()).await? {
+    let Some(parent) = parent else {
+        // Return unknown parent type for `execute_unknown_parent_action` to handle.
+        return Ok(DependencyValidationResult::UnknownParent {
+            parent_root: block.message.parent_root,
+        });
+    };
+
+    match validate_beacon_block(beacon_chain, cached_db, block, &parent.state, &parent).await? {
         ValidationResult::Accept => {}
         ValidationResult::Ignore(reason) => {
             return Ok(DependencyValidationResult::Ignore(reason));
@@ -101,7 +109,7 @@ pub async fn validate_gossip_beacon_block(
         }
     }
 
-    if parent.is_some_and(|parent| parent.pending_availability) {
+    if parent.pending_availability {
         Ok(DependencyValidationResult::ParentPendingAvailability {
             parent_root: block.message.parent_root,
             validated: GossipValidatedBlock::new(block.clone()),
@@ -116,7 +124,7 @@ async fn validate_beacon_block(
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
     state: &BeaconState,
-    parent: Option<&ParentContext>,
+    parent: &ParentContext,
 ) -> anyhow::Result<ValidationResult> {
     let store = beacon_chain.store.lock().await;
 
@@ -167,14 +175,6 @@ async fn validate_beacon_block(
             )));
         }
     }
-
-    let Some(parent) = parent else {
-        // Unknown-parent lookup is intentionally deferred to #1532. A parent held only by the
-        // coordinator has no post-state with which to validate a grandchild.
-        return Ok(ValidationResult::Ignore(
-            "Parent block not found".to_string(),
-        ));
-    };
 
     // [REJECT] The block is from a higher slot than its parent.
     if block.message.slot <= parent.block.message.slot {

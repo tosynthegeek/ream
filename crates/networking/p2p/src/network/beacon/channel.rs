@@ -8,7 +8,9 @@ use libp2p::{
 };
 use ream_consensus_beacon::blob_sidecar::BlobIdentifier;
 use ream_req_resp::{
-    beacon::messages::{BeaconResponseMessage, status::Status},
+    beacon::messages::{
+        BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier, status::Status,
+    },
     handler::RespMessage,
 };
 use tokio::sync::mpsc;
@@ -52,6 +54,11 @@ pub enum P2PRequest {
     BlobIdentifiers {
         peer_id: PeerId,
         blob_identifiers: Vec<BlobIdentifier>,
+        callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
+    },
+    DataColumnIdentifiers {
+        peer_id: PeerId,
+        column_identifiers: Vec<DataColumnsByRootIdentifier>,
         callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
     },
 }

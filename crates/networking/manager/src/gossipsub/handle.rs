@@ -53,6 +53,11 @@ use crate::{
     p2p_sender::P2PSender,
 };
 
+pub struct UnknownParentGossipBlock {
+    pub parent_root: alloy_primitives::B256,
+    pub block: ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock,
+}
+
 pub fn init_gossipsub_config_with_topics(history_length: Option<usize>) -> GossipsubConfig {
     let mut gossipsub_config = history_length.map_or_else(
         GossipsubConfig::default,
@@ -193,6 +198,7 @@ fn dependency_message_acceptance(
         DependencyValidationResult::Accept => MessageAcceptance::Accept,
         DependencyValidationResult::Reject(_) => MessageAcceptance::Reject,
         DependencyValidationResult::Ignore(_) => MessageAcceptance::Ignore,
+        DependencyValidationResult::UnknownParent { .. } => MessageAcceptance::Ignore,
         // Fully validated messages should propagate even while their local import is deferred.
         DependencyValidationResult::ParentPendingAvailability { .. } => MessageAcceptance::Accept,
     }
@@ -205,6 +211,7 @@ pub async fn handle_gossipsub_message(
     cached_db: &BeaconCacheDB,
     p2p_sender: &P2PSender,
     pending_item: &mut Option<PendingGossipItem>,
+    unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
 ) -> MessageAcceptance {
     match GossipsubMessage::decode(&message.topic, &message.data) {
         Ok(gossip_message) => match gossip_message {
@@ -258,6 +265,12 @@ pub async fn handle_gossipsub_message(
                     }
                     DependencyValidationResult::Reject(reason) => {
                         warn!("Rejecting gossipsub beacon block: {reason}");
+                    }
+                    DependencyValidationResult::UnknownParent { parent_root } => {
+                        *unknown_parent_block = Some(UnknownParentGossipBlock {
+                            parent_root,
+                            block: *signed_block,
+                        });
                     }
                     DependencyValidationResult::ParentPendingAvailability {
                         parent_root: _,
@@ -617,6 +630,9 @@ pub async fn handle_gossipsub_message(
                     DependencyValidationResult::Ignore(reason) => {
                         info!("Data column sidecar ignored: {reason}");
                     }
+                    DependencyValidationResult::UnknownParent { .. } => {
+                        unreachable!("data column validation cannot return unknown-parent")
+                    }
                     DependencyValidationResult::ParentPendingAvailability {
                         parent_root: _,
                         validated,
@@ -807,12 +823,14 @@ mod tests {
             topic,
         };
         let mut pending_item = None;
+        let mut unknown_parent_block = None;
         let acceptance = handle_gossipsub_message(
             message,
             &beacon_chain,
             &cached_db,
             &p2p_sender,
             &mut pending_item,
+            &mut unknown_parent_block,
         )
         .await;
 

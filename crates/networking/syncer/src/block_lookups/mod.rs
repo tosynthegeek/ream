@@ -447,6 +447,10 @@ impl<BlockPayload, ColumnPayload> BlockLookupCoordinator<BlockPayload, ColumnPay
         self.entries.len()
     }
 
+    pub fn contains_entry(&self, block_root: &B256) -> bool {
+        self.entries.contains_key(block_root)
+    }
+
     pub fn pending_block_count(&self) -> usize {
         self.entries
             .values()

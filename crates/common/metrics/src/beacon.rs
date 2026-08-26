@@ -7,7 +7,7 @@ use prometheus_exporter::prometheus::{
     register_int_gauge_with_registry,
 };
 
-use crate::common::set_int_gauge;
+use crate::common::{set_int_gauge, set_int_gauge_vec};
 
 // Provisioning each metrics
 lazy_static::lazy_static! {
@@ -92,6 +92,47 @@ lazy_static::lazy_static! {
             opts,
             default_registry()
         ).expect("failed to create BEACON_DATA_COLUMN_SIDECAR_GOSSIP_VERIFICATION_SECONDS")
+    };
+
+    // Block lookup recovery metrics
+    pub static ref BEACON_BLOCK_LOOKUP_ENTRIES: IntGaugeVec = register_int_gauge_vec_with_registry!(
+        "beacon_block_lookup_entries",
+        "Current number of retained block lookup entries by lookup kind",
+        &["kind"],
+        default_registry()
+    ).expect("failed to create BEACON_BLOCK_LOOKUP_ENTRIES int gauge vec");
+
+    pub static ref BEACON_BLOCK_LOOKUP_EVENTS_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+        "beacon_block_lookup_events_total",
+        "Total block lookup lifecycle events by lookup kind and event",
+        &["kind", "event"],
+        default_registry()
+    ).expect("failed to create BEACON_BLOCK_LOOKUP_EVENTS_TOTAL int counter vec");
+
+    pub static ref BEACON_DATA_COLUMN_FETCH_ENTRIES: IntGaugeVec = register_int_gauge_vec_with_registry!(
+        "beacon_data_column_fetch_entries",
+        "Current number of data column fetch entries by state",
+        &["state"],
+        default_registry()
+    ).expect("failed to create BEACON_DATA_COLUMN_FETCH_ENTRIES int gauge vec");
+
+    pub static ref BEACON_DATA_COLUMN_FETCH_ATTEMPTS_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+        "beacon_data_column_fetch_attempts_total",
+        "Total data column fetch attempts by outcome",
+        &["outcome"],
+        default_registry()
+    ).expect("failed to create BEACON_DATA_COLUMN_FETCH_ATTEMPTS_TOTAL int counter vec");
+
+    pub static ref BEACON_DATA_COLUMN_FETCH_DURATION_SECONDS: Histogram = {
+        // Covers normal peer round trips through slow attempts approaching the request timeout.
+        let opts = HistogramOpts::new(
+            "beacon_data_column_fetch_duration_seconds",
+            "Time spent requesting, verifying, and importing data columns from one peer"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]);
+        register_histogram_with_registry!(
+            opts,
+            default_registry()
+        ).expect("failed to create BEACON_DATA_COLUMN_FETCH_DURATION_SECONDS")
     };
 
     // PeerDAS: Data Availability / Reconstruction Metrics
@@ -227,6 +268,10 @@ lazy_static::lazy_static! {
 pub fn init_beacon_metrics() {
     set_int_gauge(&BEACON_CUSTODY_GROUPS, 0);
     set_int_gauge(&BEACON_CUSTODY_GROUPS_BACKFILLED, 0);
+    set_int_gauge_vec(&BEACON_BLOCK_LOOKUP_ENTRIES, 0, &["pending_availability"]);
+    set_int_gauge_vec(&BEACON_BLOCK_LOOKUP_ENTRIES, 0, &["unknown_parent"]);
+    set_int_gauge_vec(&BEACON_DATA_COLUMN_FETCH_ENTRIES, 0, &["tracked"]);
+    set_int_gauge_vec(&BEACON_DATA_COLUMN_FETCH_ENTRIES, 0, &["in_flight"]);
     set_peer_count(0);
 }
 

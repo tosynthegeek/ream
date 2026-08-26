@@ -43,6 +43,7 @@ use ream_req_resp::{
         BeaconRequestMessage, BeaconResponseMessage,
         blob_sidecars::BlobSidecarsByRootV1Request,
         blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request},
+        data_column_sidecars::DataColumnSidecarsByRootV1Request,
         meta_data::GetMetaDataV3,
         ping::Ping,
         status::Status,
@@ -206,18 +207,28 @@ impl Network {
                 .build()
         };
 
+        let mut meta_data =
+            read_meta_data_from_disk(config.data_dir.clone()).unwrap_or_else(|err| {
+                error!("Failed to read meta data from disk: {err:?}");
+                GetMetaDataV3::default()
+            });
+        let custody_group_count = config.discv5_config.custody_group_count.0;
+        let meta_data_changed = meta_data.custody_group_count != custody_group_count;
+        if meta_data_changed {
+            meta_data.seq_number = meta_data.seq_number.saturating_add(1);
+            meta_data.custody_group_count = custody_group_count;
+        }
+
         let network_state = Arc::new(NetworkState {
             local_enr: RwLock::new(local_enr),
             peer_table: RwLock::new(HashMap::new()),
-            meta_data: RwLock::new(
-                read_meta_data_from_disk(config.data_dir.clone()).unwrap_or_else(|err| {
-                    error!("Failed to read meta data from disk: {err:?}");
-                    GetMetaDataV3::default()
-                }),
-            ),
+            meta_data: RwLock::new(meta_data),
             status: RwLock::new(status),
             data_dir: config.data_dir.clone(),
         });
+        if meta_data_changed {
+            network_state.write_meta_data_to_disk()?;
+        }
 
         let mut network = Network {
             peer_id: PeerId::from_public_key(&PublicKey::from(local_key.public().clone())),
@@ -348,6 +359,13 @@ impl Network {
                             },
                             P2PRequest::BlobIdentifiers { peer_id, blob_identifiers, callback } => {
                                 if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::BlobSidecarsByRoot(BlobSidecarsByRootV1Request::new(blob_identifiers))) {
+                                    self.callbacks.insert(request_id, callback);
+                                } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {
+                                    warn!("Failed to send error response: {err:?}");
+                                }
+                            },
+                            P2PRequest::DataColumnIdentifiers { peer_id, column_identifiers, callback } => {
+                                if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::DataColumnSidecarsByRoot(DataColumnSidecarsByRootV1Request::new(column_identifiers))) {
                                     self.callbacks.insert(request_id, callback);
                                 } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {
                                     warn!("Failed to send error response: {err:?}");

@@ -239,7 +239,7 @@ impl OperationPool {
     }
 
     /// Record aggregation-bit positions from attestations that have been included in an
-    /// imported block so they are excluded from future packing.
+    /// imported block so attestations without new votes can be skipped during future packing.
     pub fn mark_attestations_included(&self, attestations: &[Attestation]) {
         let mut included_attestation_bits = self.included_attestation_bits.write();
         for attestation in attestations {
@@ -313,15 +313,15 @@ impl OperationPool {
     }
 }
 
-/// Aggregates non-overlapping votes, excluding bits already present in `already_included`.
-/// Returns `None` if no new votes remain.
+/// Aggregates non-overlapping attestations that contain votes not present in `already_included`.
+/// The selected attestations retain every signed bit so their aggregate signature stays valid.
 fn aggregate_attestation_group(
     group: &[Attestation],
     already_included: &HashSet<usize>,
 ) -> Option<Attestation> {
     let mut aggregate = group.first()?.clone();
     let mut aggregation_bits = aggregate.aggregation_bits.clone();
-    let mut seen = already_included.clone();
+    let mut seen = HashSet::<usize>::default();
     let mut signatures = Vec::new();
 
     for index in 0..aggregation_bits.len() {
@@ -342,6 +342,9 @@ fn aggregate_attestation_group(
                 .iter()
                 .any(|position| *position >= aggregation_bits.len())
             || set_bits.iter().any(|position| seen.contains(position))
+            || set_bits
+                .iter()
+                .all(|position| already_included.contains(position))
         {
             continue;
         }
@@ -409,13 +412,13 @@ mod tests {
                     root: B256::repeat_byte(0xCD),
                 },
             },
-            signature: BLSSignature::default(),
+            signature: BLSSignature::infinity(),
             committee_bits,
         }
     }
 
     #[test]
-    fn aggregate_attestation_group_excludes_already_included_bits() {
+    fn aggregate_attestation_group_preserves_signed_bits_for_partial_overlap() {
         // Two validators (bits 0 and 1) attested for the same data; bit 0 already landed
         // on-chain in an earlier block.
         let attestation = make_attestation(10, 0, 1, 4, &[0, 1]);
@@ -425,7 +428,7 @@ mod tests {
         let aggregate = aggregate_attestation_group(&[attestation], &already_included)
             .expect("bit 1 is new and should still be aggregated");
 
-        assert!(!aggregate.aggregation_bits.get(0).unwrap());
+        assert!(aggregate.aggregation_bits.get(0).unwrap());
         assert!(aggregate.aggregation_bits.get(1).unwrap());
     }
 

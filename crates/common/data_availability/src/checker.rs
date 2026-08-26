@@ -101,6 +101,26 @@ impl<State> DataAvailabilityChecker<State> {
             .and_then(|entry| entry.pending_block.as_ref())
     }
 
+    pub fn missing_columns(&self, block_root: &B256) -> Vec<u64> {
+        let Some(entry) = self.entries.get(block_root) else {
+            return Vec::new();
+        };
+        let mut missing = self
+            .required_columns
+            .difference(&entry.received_columns)
+            .copied()
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing
+    }
+
+    pub fn pending_block_roots(&self) -> Vec<B256> {
+        self.entries
+            .iter()
+            .filter_map(|(block_root, entry)| entry.pending_block.as_ref().map(|_| *block_root))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

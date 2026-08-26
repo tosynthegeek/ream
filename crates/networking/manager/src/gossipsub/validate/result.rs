@@ -12,5 +12,6 @@ pub enum DependencyValidationResult<T> {
     Accept,
     Ignore(String),
     Reject(String),
+    UnknownParent { parent_root: B256 },
     ParentPendingAvailability { parent_root: B256, validated: T },
 }

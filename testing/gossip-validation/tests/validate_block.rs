@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn test_valid_signature_with_unknown_parent_is_ignored() {
+    pub async fn test_unknown_parent_returns_structured_lookup_result() {
         initialize_test_network_spec();
         let (beacon_chain, cached_db, parent_root, _, _) = db_setup_with_parent(false).await;
         let incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
@@ -335,16 +335,17 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert!(
-            matches!(result, DependencyValidationResult::Ignore(reason) if reason.contains("Parent block not found"))
+        assert_eq!(
+            result,
+            DependencyValidationResult::UnknownParent { parent_root }
         );
         assert_ne!(parent_root, B256::ZERO);
     }
 
     #[tokio::test]
-    pub async fn test_bad_signature_with_unknown_parent_is_rejected() {
+    pub async fn test_unknown_parent_is_not_signature_checked_against_head_state() {
         initialize_test_network_spec();
-        let (beacon_chain, cached_db, _parent_root, _, _) = db_setup_with_parent(false).await;
+        let (beacon_chain, cached_db, parent_root, _, _) = db_setup_with_parent(false).await;
         let mut incoming_beacon_block = read_ssz_snappy_file::<SignedBeaconBlock>(
             "./assets/sepolia/blocks/child_9552076.ssz_snappy",
         )
@@ -356,8 +357,9 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert!(
-            matches!(result, DependencyValidationResult::Reject(reason) if reason.contains("Invalid signature"))
+        assert_eq!(
+            result,
+            DependencyValidationResult::UnknownParent { parent_root }
         );
     }
 

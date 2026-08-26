@@ -18,6 +18,16 @@ pub struct DataColumnsByRootIdentifier {
     pub columns: VariableList<u64, NumberOfColumns>,
 }
 
+impl DataColumnsByRootIdentifier {
+    pub fn new(block_root: B256, columns: Vec<u64>) -> anyhow::Result<Self> {
+        Ok(Self {
+            block_root,
+            columns: VariableList::new(columns)
+                .map_err(|err| anyhow::anyhow!("too many column indices requested: {err:?}"))?,
+        })
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Encode, Decode)]
 #[ssz(struct_behaviour = "transparent")]
 pub struct DataColumnSidecarsByRootV1Request {
