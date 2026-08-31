@@ -13,6 +13,7 @@ use ream_consensus_misc::{
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::ExecutionEngine;
+use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
 use ream_fork_choice_beacon::{
     data_availability::PendingBlock,
     handlers::{
@@ -20,6 +21,10 @@ use ream_fork_choice_beacon::{
         process_available_block,
     },
     store::Store,
+};
+use ream_metrics::{
+    BEACON_BLOCK_PROCESSING_SECONDS, BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS,
+    BEACON_STORE_LOCK_WAIT_SECONDS,
 };
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
@@ -57,6 +62,7 @@ pub struct BeaconChain {
     pub execution_engine: Option<ExecutionEngine>,
     pub event_sender: Option<broadcast::Sender<BeaconEvent>>,
     block_import_sender: broadcast::Sender<BlockImportEvent>,
+    execution_forkchoice: Mutex<Option<ForkchoiceStateV1>>,
     force_data_availability_checks: bool,
 }
 
@@ -76,6 +82,7 @@ impl BeaconChain {
             execution_engine,
             event_sender,
             block_import_sender,
+            execution_forkchoice: Mutex::new(None),
             force_data_availability_checks: false,
         }
     }
@@ -98,7 +105,12 @@ impl BeaconChain {
         signed_block: SignedBeaconBlock,
     ) -> anyhow::Result<BlockProcessingOutcome> {
         let block_root = signed_block.message.tree_hash_root();
+        let block_processing_timer = BEACON_BLOCK_PROCESSING_SECONDS.start_timer();
+
+        let lock_wait_timer = BEACON_STORE_LOCK_WAIT_SECONDS.start_timer();
         let mut store = self.store.lock().await;
+        lock_wait_timer.observe_duration();
+
         let network_spec = beacon_network_spec();
         let verify_data_availability = self.force_data_availability_checks
             || is_data_availability_check_required(
@@ -129,6 +141,12 @@ impl BeaconChain {
 
         self.notify_block_imported(block_root);
         self.publish_block_event(block_event);
+
+        let forkchoice_update_timer = BEACON_EXECUTION_FORKCHOICE_UPDATE_SECONDS.start_timer();
+        self.update_execution_forkchoice(true).await;
+        forkchoice_update_timer.observe_duration();
+
+        block_processing_timer.observe_duration();
         Ok(BlockProcessingOutcome::Imported { block_root })
     }
 
@@ -146,6 +164,7 @@ impl BeaconChain {
         if let Some((imported_block_root, block_event)) = imported_block {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
+            self.update_execution_forkchoice(true).await;
         }
 
         Ok(())
@@ -178,6 +197,7 @@ impl BeaconChain {
         if let Some((imported_block_root, block_event)) = imported_block {
             self.notify_block_imported(imported_block_root);
             self.publish_block_event(block_event);
+            self.update_execution_forkchoice(true).await;
         }
 
         Ok(())
@@ -217,6 +237,73 @@ impl BeaconChain {
         self.process_block_attestations(store, &signed_block);
         let block_event = self.build_block_event(store, &signed_block);
         Ok((block_root, block_event))
+    }
+
+    /// Returns zero when the beacon block has no known execution payload.
+    fn execution_block_hash(store: &Store, block_root: B256) -> B256 {
+        store
+            .db
+            .block_provider()
+            .get(block_root)
+            .ok()
+            .flatten()
+            .map(|block| block.message.body.execution_payload.block_hash)
+            .unwrap_or_default()
+    }
+
+    /// Translates consensus fork choice into Engine API block hashes.
+    fn build_forkchoice_state(&self, store: &Store) -> Option<ForkchoiceStateV1> {
+        self.execution_engine.as_ref()?;
+
+        let head_root = store
+            .get_head()
+            .inspect_err(|err| warn!("Failed to read head for forkchoice update: {err}"))
+            .ok()?;
+        let justified_root = store.db.justified_checkpoint_provider().get().ok()?.root;
+        let finalized_root = store.db.finalized_checkpoint_provider().get().ok()?.root;
+
+        Some(ForkchoiceStateV1 {
+            head_block_hash: Self::execution_block_hash(store, head_root),
+            safe_block_hash: Self::execution_block_hash(store, justified_root),
+            finalized_block_hash: Self::execution_block_hash(store, finalized_root),
+        })
+    }
+
+    /// Updates the execution head without rolling back an accepted consensus import on failure.
+    async fn update_execution_forkchoice(&self, allow_initial_update: bool) {
+        let Some(execution_engine) = self.execution_engine.as_ref() else {
+            return;
+        };
+
+        // Recompute after serialization so a delayed import cannot send stale state last.
+        let mut last_forkchoice = self.execution_forkchoice.lock().await;
+        if last_forkchoice.is_none() && !allow_initial_update {
+            return;
+        }
+        let forkchoice_state = {
+            let store = self.store.lock().await;
+            self.build_forkchoice_state(&store)
+        };
+        let Some(forkchoice_state) = forkchoice_state else {
+            return;
+        };
+        if last_forkchoice.as_ref() == Some(&forkchoice_state) {
+            return;
+        }
+
+        match execution_engine
+            .engine_forkchoice_updated_v3(forkchoice_state, None)
+            .await
+        {
+            Ok(result) => {
+                *last_forkchoice = Some(forkchoice_state);
+                debug!(
+                    "Forkchoice updated: execution engine reported {:?}",
+                    result.payload_status.status
+                );
+            }
+            Err(err) => warn!("Failed to update execution engine forkchoice: {err}"),
+        }
     }
 
     fn notify_block_imported(&self, block_root: B256) {
@@ -273,6 +360,8 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attester_slashing(&mut store, attester_slashing)?;
+        drop(store);
+        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
@@ -283,12 +372,16 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attestation(&mut store, attestation, is_from_block)?;
+        drop(store);
+        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
     pub async fn process_tick(&self, time: u64) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_tick(&mut store, time)?;
+        drop(store);
+        self.update_execution_forkchoice(false).await;
         Ok(())
     }
 

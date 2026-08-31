@@ -3,7 +3,6 @@ use alloy_consensus::{
     proofs::{ordered_trie_root, ordered_trie_root_with_encoder},
 };
 use alloy_primitives::{Address, B64, B256, Bloom, Bytes, U256, b256};
-use alloy_rlp::Encodable;
 use ream_consensus_misc::{misc::checksummed_address, withdrawal::Withdrawal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,7 +87,11 @@ impl ExecutionPayload {
             gas_used: self.gas_used,
             timestamp: self.timestamp,
             extra_data: Bytes::from(Vec::from(self.extra_data.clone())),
-            mix_hash: B256::ZERO,
+            // EIP-4399 repurposed the header's `mixHash` slot to carry the beacon chain's
+            // `prev_randao`. Leaving it zero makes the recomputed hash differ from every
+            // real block, so `is_valid_block_hash` rejects the payload before the execution
+            // engine is ever consulted.
+            mix_hash: self.prev_randao,
             nonce: B64::ZERO,
             base_fee_per_gas: Some(self.base_fee_per_gas.to::<u64>()),
             withdrawals_root: Some(withdrawals_root),
@@ -142,14 +145,100 @@ fn compute_requests_hash(block_requests: &[Bytes]) -> B256 {
 
 /// Calculate the Merkle Patricia Trie root hash from a list of items
 /// `(rlp(index), encoded(item))` pairs.
-pub fn calculate_transactions_root<T>(transactions: &[T]) -> B256
-where
-    T: Encodable,
-{
-    ordered_trie_root_with_encoder(transactions, |tx: &T, buf| tx.encode(buf))
+///
+/// Payload transactions are already EIP-2718 envelopes, so they go into the trie exactly as
+/// they arrived. Running them through `Encodable` instead would wrap each one in a second RLP
+/// string header and silently produce a root no other client agrees with.
+pub fn calculate_transactions_root(transactions: &[Bytes]) -> B256 {
+    ordered_trie_root_with_encoder(transactions, |tx: &Bytes, buf| buf.extend_from_slice(tx))
 }
 
 /// Calculates the root hash of the withdrawals.
 pub fn calculate_withdrawals_root(withdrawals: &[Withdrawal]) -> B256 {
     ordered_trie_root(withdrawals)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{address, bytes};
+
+    use super::*;
+
+    /// Block 1 of a Kurtosis devnet, as reth reported it over `eth_getBlockByNumber`.
+    /// Empty block, so the transactions/withdrawals/receipts roots are all the empty-trie
+    /// root and the requests list is empty.
+    fn devnet_block_1() -> ExecutionPayload {
+        ExecutionPayload {
+            parent_hash: b256!("9eba23403adfc7186ba8b484cf33b63edb357144427661022b1b9dac2b5637ed"),
+            fee_recipient: address!("8943545177806ED17B9F23F0a21ee5948eCaa776"),
+            state_root: b256!("f49c705b3d0a5fac1da62f0d8dfb218df0d4299a48ccf96157c6c1e35837eb14"),
+            receipts_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            logs_bloom: FixedVector::new(vec![0u8; 256]).expect("bloom is 256 bytes"),
+            prev_randao: b256!("9eba23403adfc7186ba8b484cf33b63edb357144427661022b1b9dac2b5637ed"),
+            block_number: 1,
+            gas_limit: 0x392a220,
+            gas_used: 0,
+            timestamp: 0x6a770600,
+            extra_data: VariableList::new(bytes!("726574682f76322e342e312f6c696e7578").to_vec())
+                .expect("extra data fits"),
+            base_fee_per_gas: U256::from(0x342770c0u64),
+            block_hash: b256!("ea01eaa48a97487659f390c6f5f04278db0a8d88bf9c0f3b1774e5290891d793"),
+            transactions: Transactions::empty(),
+            withdrawals: VariableList::empty(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
+
+    /// The recomputed header hash gates every block import: `is_valid_block_hash` rejects
+    /// the payload before the execution engine is consulted, so any field dropped while
+    /// rebuilding the header silently stops the node from ever following a chain.
+    #[test]
+    fn test_to_execution_header_reproduces_real_block_hash() {
+        let payload = devnet_block_1();
+        let parent_beacon_block_root =
+            b256!("1031426cacba357a47278cb9d70407305cb155abc6ac6bb25d023adb8af04767");
+
+        assert_eq!(
+            payload
+                .to_execution_header(parent_beacon_block_root, &[])
+                .hash_slow(),
+            payload.block_hash,
+        );
+    }
+
+    /// Block 1 is empty, so it exercises only the empty-trie root. Transactions reach the
+    /// trie as raw EIP-2718 envelopes; RLP-encoding them a second time yields a root that
+    /// looks perfectly valid locally and matches no other client.
+    #[test]
+    fn test_calculate_transactions_root_matches_a_real_block() {
+        let fixture = include_str!("../../resources/transactions_root_block.txt");
+        let mut lines = fixture
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty());
+
+        let expected_root: B256 = lines
+            .next()
+            .expect("fixture states the expected root first")
+            .parse()
+            .expect("expected root is hex");
+        let transactions = lines
+            .map(|line| line.parse::<Bytes>().expect("transaction is hex"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(calculate_transactions_root(&transactions), expected_root);
+    }
+
+    /// EIP-4399: the header's `mixHash` slot carries `prev_randao`.
+    #[test]
+    fn test_to_execution_header_carries_prev_randao_as_mix_hash() {
+        let payload = devnet_block_1();
+
+        assert_eq!(
+            payload.to_execution_header(B256::ZERO, &[]).mix_hash,
+            payload.prev_randao,
+        );
+    }
 }

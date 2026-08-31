@@ -231,6 +231,9 @@ impl NetworkManagerService {
             disable_discovery: config.disable_discovery,
             attestation_subnets: AttestationSubnets::new(),
             sync_committee_subnets: SyncCommitteeSubnets::new(),
+            // Must match the count advertised in our MetaData: peers cross-check the ENR
+            // `cgc` against it and treat a mismatch, or a value below CUSTODY_REQUIREMENT,
+            // as a fault worth banning us for.
             custody_group_count,
         };
 
@@ -562,6 +565,24 @@ impl NetworkManagerService {
 
                     if let Err(err) =  beacon_chain.process_tick(time).await {
                         error!("Failed to process gossipsub tick: {err}");
+                    }
+
+                    // Started ahead of genesis: p2p, discovery and the HTTP API all stay up so
+                    // the gossip mesh is formed by slot 0. `on_tick` is a no-op until then, but
+                    // announce the wait so a node that looks idle is visibly just early.
+                    // Everything below still runs: skipping it would freeze the store's slot
+                    // clock and make blocks arriving right after genesis look future-dated.
+                    if let Ok(genesis_time) = {
+                        let store = beacon_chain.store.lock().await;
+                        store.db.genesis_time_provider().get()
+                    } && time < genesis_time
+                    {
+                        let remaining = genesis_time - time;
+                        warn!(
+                            "Waiting for genesis in {:02}:{:02}",
+                            remaining / 60,
+                            remaining % 60,
+                        );
                     }
 
                     let slots = {

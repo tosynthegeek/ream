@@ -6361,6 +6361,7 @@ dependencies = [
  "ream-consensus-misc",
  "ream-events-beacon",
  "ream-execution-engine",
+ "ream-execution-rpc-types",
  "ream-fork-choice-beacon",
  "ream-metrics",
  "ream-network-spec",
@@ -6830,6 +6831,7 @@ dependencies = [
  "ethereum_serde_utils",
  "ream-consensus-misc",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tracing",
 ]

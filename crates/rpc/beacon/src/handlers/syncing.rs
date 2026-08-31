@@ -10,27 +10,7 @@ use ream_execution_engine::ExecutionEngine;
 use ream_fork_choice_beacon::store::Store;
 use ream_operation_pool::OperationPool;
 use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
-use serde::{Deserialize, Serialize};
 use tracing::error;
-
-#[derive(Serialize, Deserialize, Default)]
-pub struct Syncing {
-    sync_status: SyncStatus,
-}
-
-impl Syncing {
-    pub fn new(head_slot: u64, sync_distance: u64, el_offline: bool, is_syncing: bool) -> Self {
-        Self {
-            sync_status: SyncStatus {
-                head_slot,
-                sync_distance,
-                is_syncing,
-                el_offline,
-                is_optimistic: EXECUTION_OPTIMISTIC,
-            },
-        }
-    }
-}
 
 pub async fn calculate_sync_status(
     db: &BeaconDB,
@@ -90,5 +70,7 @@ pub async fn get_syncing_status(
 ) -> Result<impl Responder, ApiError> {
     let sync_status = calculate_sync_status(&db, &operation_pool, &execution_engine).await?;
 
-    Ok(HttpResponse::Ok().json(DataResponse::new(Syncing { sync_status })))
+    // `data` is the syncing status itself: wrapping it in another object makes every
+    // spec-compliant consumer report the endpoint as unsupported and the node as offline.
+    Ok(HttpResponse::Ok().json(DataResponse::new(sync_status)))
 }
