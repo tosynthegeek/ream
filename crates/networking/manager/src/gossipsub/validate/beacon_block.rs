@@ -53,14 +53,8 @@ pub async fn validate_gossip_beacon_block(
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
-    let (head_state, parent) = {
+    let (fallback_head_state, parent) = {
         let store = beacon_chain.store.lock().await;
-        let head_root = store.get_head()?;
-        let head_state = store
-            .db
-            .state_provider()
-            .get(head_root)?
-            .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
 
         let parent = if let Some(parent_block) =
             store.db.block_provider().get(block.message.parent_root)?
@@ -94,12 +88,37 @@ pub async fn validate_gossip_beacon_block(
         } else {
             None
         };
-        (head_state, parent)
+
+        // `get_head`/`recompute_head` is the single most expensive call in the whole client — on
+        // this devnet it grew from ~0.2s to 20s+ as the (never-pruned, since finality never
+        // advances) block tree grew past ~130 blocks, and it was being called unconditionally
+        // for every single incoming block regardless of whether its result was ever used.
+        // `head_state` is only actually read below in the fallback branch, when the parent isn't
+        // known yet — in the overwhelmingly common case (parent already known, using
+        // `parent.state` instead) it was computed and then simply discarded. Only pay for it
+        // when it's actually needed.
+        let fallback_head_state =
+            if parent.is_none() {
+                let head_root = store.get_head()?;
+                Some(
+                    store.db.state_provider().get(head_root)?.ok_or_else(|| {
+                        anyhow!("No beacon state found for head root: {head_root}")
+                    })?,
+                )
+            } else {
+                None
+            };
+
+        (fallback_head_state, parent)
     };
 
     // Looking up the parent above does not classify the message. Validation still checks the
     // signature before returning unknown-parent, as required by the gossip specification.
-    let state = parent.as_ref().map_or(&head_state, |parent| &parent.state);
+    let state = parent
+        .as_ref()
+        .map(|parent| &parent.state)
+        .or(fallback_head_state.as_ref())
+        .ok_or_else(|| anyhow!("no state available for gossip block validation"))?;
     match validate_beacon_block(beacon_chain, cached_db, block, state, parent.as_ref()).await? {
         BlockValidationOutcome::Accept => {}
         BlockValidationOutcome::DeferUnknownParent => {

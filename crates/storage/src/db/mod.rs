@@ -4,7 +4,7 @@ pub mod lean;
 use std::{fs, io, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use beacon::BeaconDB;
+use beacon::{BeaconDB, HeadCacheEntry};
 use lean::LeanDB;
 use parking_lot::RwLock;
 use redb::{Builder, Database};
@@ -100,7 +100,7 @@ impl ReamDB {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
             cache: None,
-            head_cache: Arc::new(RwLock::new(None)),
+            head_cache: Arc::new(RwLock::new(HeadCacheEntry::default())),
         })
     }
 

@@ -35,15 +35,30 @@ use crate::{
 };
 
 /// How long a cached head root is trusted before `Store::get_head` is required to
-/// recompute it from the DB again.
+/// recompute it from the DB again, in the absence of any invalidating mutation.
 pub const HEAD_CACHE_TTL: Duration = Duration::from_millis(300);
+
+/// Minimum time between actual head recomputes, even under continuous invalidation pressure.
+pub const MIN_HEAD_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HeadCacheEntry {
+    /// The most recently computed head root, if one has ever been computed.
+    value: Option<B256>,
+    /// When `value` was last actually (re)computed — not merely reused from cache.
+    computed_at: Option<Instant>,
+    /// Set by `invalidate_cached_head()`. A dirty entry is still served as-is until
+    /// `MIN_HEAD_RECOMPUTE_INTERVAL` has elapsed since `computed_at`, at which point the next
+    /// `cached_head()` call reports a miss so the caller recomputes.
+    dirty: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct BeaconDB {
     pub db: Arc<Database>,
     pub data_dir: PathBuf,
     pub(crate) cache: Option<Arc<BeaconCacheDB>>,
-    pub head_cache: Arc<RwLock<Option<(B256, Instant)>>>,
+    pub(crate) head_cache: Arc<RwLock<HeadCacheEntry>>,
 }
 
 impl BeaconDB {
@@ -55,25 +70,44 @@ impl BeaconDB {
     }
 
     pub fn cached_head(&self) -> Option<B256> {
-        let (root, computed_at) = (*self.head_cache.read())?;
-        if computed_at.elapsed() < HEAD_CACHE_TTL {
-            Some(root)
-        } else {
-            None
+        let entry = self.head_cache.read();
+        let value = entry.value?;
+        let computed_at = entry.computed_at?;
+
+        if !entry.dirty {
+            // Plain TTL path: nothing has invalidated it, so the usual freshness window applies.
+            if computed_at.elapsed() < HEAD_CACHE_TTL {
+                return Some(value);
+            }
+            return None;
         }
+
+        // Invalidated, but still within the debounce window since it was last actually
+        // recomputed — serve it anyway rather than forcing yet another recompute for every
+        // invalidation that lands inside this short interval.
+        if computed_at.elapsed() < MIN_HEAD_RECOMPUTE_INTERVAL {
+            return Some(value);
+        }
+
+        None
     }
 
-    /// Records a freshly computed head root, timestamped now.
+    /// Records a freshly computed head root, timestamped now, and clears the dirty flag.
     pub fn set_cached_head(&self, root: B256) {
-        *self.head_cache.write() = Some((root, Instant::now()));
+        *self.head_cache.write() = HeadCacheEntry {
+            value: Some(root),
+            computed_at: Some(Instant::now()),
+            dirty: false,
+        };
     }
 
-    /// Forces the next `cached_head()` call to miss, e.g. immediately after a fork-choice-
-    /// relevant mutation (new block imported, new attesting weight, proposer boost reset,
-    /// justified/finalized checkpoint advanced) so the next reader is guaranteed to see an
-    /// up-to-date recomputation rather than a value that predates the change.
+    /// Marks the cached head as stale after a fork-choice-relevant mutation (new block
+    /// imported, new attesting weight, proposer boost reset, justified/finalized checkpoint
+    /// advanced). Does not force an immediate recompute — see `MIN_HEAD_RECOMPUTE_INTERVAL` —
+    /// it only guarantees one will happen once the debounce window has passed.
     pub fn invalidate_cached_head(&self) {
-        *self.head_cache.write() = None;
+        let mut entry = self.head_cache.write();
+        entry.dirty = true;
     }
 
     pub fn block_provider(&self) -> BeaconBlockTable {
