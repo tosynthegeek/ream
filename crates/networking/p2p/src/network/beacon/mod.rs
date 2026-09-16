@@ -565,7 +565,6 @@ impl Network {
                     ));
                     self.send_request(peer_id, ping_message);
                 }
-                set_peer_count(self.network_state.connected_peers().len() as i64);
                 None
             }
             SwarmEvent::ConnectionClosed {
@@ -908,6 +907,8 @@ impl Network {
                     });
                 self.peers_to_ping.insert(peer_id);
             }
+            // A transport connection is only counted after a compatible Status exchange.
+            set_peer_count(self.network_state.connected_peers().len() as i64);
         }
     }
 
@@ -1048,6 +1049,8 @@ mod tests {
             },
             data_dir: std::env::temp_dir().join("ream_network_test"),
         };
+
+        std::fs::create_dir_all(&config.data_dir)?;
 
         Network::init(
             executor,
@@ -1326,5 +1329,7 @@ mod tests {
 
         assert_eq!(peer_from_network_2.state, ConnectionState::Connected);
         assert_eq!(peer_from_network_2.direction, Direction::Outbound);
+        assert_eq!(ream_metrics::BEACON_PEER_COUNT.get(), 1);
+        assert_eq!(ream_metrics::LIBP2P_PEERS.get(), 1);
     }
 }

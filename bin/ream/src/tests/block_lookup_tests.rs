@@ -33,7 +33,13 @@ use ream_network_manager::{
         apply_coordinator_update, execute_coordinator_action, insert_pending_item,
     },
     data_availability_fetch::{ColumnFetchOutcome, fetch_missing_columns},
-    gossipsub::handle::{Message, MessageAcceptance, handle_gossipsub_message},
+    gossipsub::{
+        handle::{Message, MessageAcceptance, handle_gossipsub_message},
+        validate::{
+            data_column_sidecar::{GossipValidatedDataColumn, validate_data_column_sidecar_full},
+            result::DependencyValidationResult,
+        },
+    },
     p2p_sender::P2PSender,
     service::NetworkManagerService,
     unknown_parent_lookup::{apply_unknown_parent_update, spawn_unknown_parent_action},
@@ -572,6 +578,104 @@ fn corrupt_fixture_state_root(fixture: &mut BlobBlockFixture, blob_seed: u8) {
         get_data_column_sidecars_from_block(&fixture.signed_block, vec![cells_and_proofs])
             .expect("corrupted fixture sidecar should build")[0]
             .clone();
+}
+
+async fn validate_gossip_column(
+    harness: &GossipLookupHarness,
+    column: &DataColumnSidecar,
+) -> DependencyValidationResult<GossipValidatedDataColumn> {
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should follow the Unix epoch")
+            .as_millis(),
+    )
+    .expect("current time should fit in u64 milliseconds");
+    validate_data_column_sidecar_full(
+        column,
+        &harness.beacon_chain,
+        now_ms,
+        column.compute_subnet(),
+        &harness.cached_db,
+    )
+    .await
+    .expect("column validation should not error")
+}
+
+#[tokio::test]
+#[serial]
+async fn test_data_column_header_checks_are_cached_per_signed_header() {
+    let (harness, genesis_state, genesis_block) =
+        GossipLookupHarness::new("data_column_header_cache").await;
+    harness.wait_for_slot(4).await;
+
+    let fixture = build_blob_block(&genesis_state, &genesis_block, 1, None, 1).await;
+    let (blob, _) = sample_blob_and_commitment(1).expect("sample blob should be reproducible");
+    let cells_and_proofs =
+        compute_cells_and_kzg_proofs(&blob, das_context()).expect("blob should encode to cells");
+    let columns =
+        get_data_column_sidecars_from_block(&fixture.signed_block, vec![cells_and_proofs])
+            .expect("fixture sidecars should build");
+    let header_root = columns[1].signed_block_header.message.tree_hash_root();
+
+    assert!(matches!(
+        validate_gossip_column(&harness, &columns[1]).await,
+        DependencyValidationResult::Accept
+    ));
+    assert!(
+        harness
+            .cached_db
+            .validated_data_column_headers
+            .read()
+            .await
+            .contains(&header_root),
+        "a fully validated column must remember its signed header"
+    );
+
+    // Break the parent state the header checks read, so only a remembered header can still pass.
+    {
+        let store = harness.beacon_chain.store.lock().await;
+        let parent_root = genesis_block.message.tree_hash_root();
+        let mut parent_state = store
+            .db
+            .state_provider()
+            .get(parent_root)
+            .expect("parent state lookup should succeed")
+            .expect("parent state should exist");
+        let proposer_index = fixture.signed_block.message.proposer_index as usize;
+        parent_state.validators[proposer_index].public_key =
+            super::public_key_from_private_key(indexed_private_key(30_000));
+        store
+            .db
+            .state_provider()
+            .insert(parent_root, parent_state)
+            .expect("poisoned parent state should insert");
+    }
+
+    assert!(
+        matches!(
+            validate_gossip_column(&harness, &columns[2]).await,
+            DependencyValidationResult::Accept
+        ),
+        "another column of a validated header must not repeat the parent-state checks"
+    );
+
+    // The remembered header does not vouch for the column's own cells.
+    let mut wrong_proofs = columns[3].clone();
+    wrong_proofs.kzg_proofs = columns[4].kzg_proofs.clone();
+    assert!(matches!(
+        validate_gossip_column(&harness, &wrong_proofs).await,
+        DependencyValidationResult::Reject(_)
+    ));
+
+    // Nor for a different signature over the same header, which is checked again and fails
+    // against the poisoned parent state.
+    let mut resigned = columns[5].clone();
+    resigned.signed_block_header.signature = ream_bls::BLSSignature::infinity();
+    assert!(matches!(
+        validate_gossip_column(&harness, &resigned).await,
+        DependencyValidationResult::Reject(_)
+    ));
 }
 
 #[tokio::test]

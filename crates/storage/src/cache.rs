@@ -5,13 +5,20 @@ use lru::LruCache;
 use ream_bls::{BLSSignature, PublicKey};
 use ream_consensus_beacon::{
     bls_to_execution_change::BLSToExecutionChange,
+    data_column_sidecar::NUMBER_OF_COLUMNS,
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
 };
 use ream_consensus_lean::{block::SignedBlock, state::LeanState};
-use ream_consensus_misc::constants::beacon::SYNC_COMMITTEE_SIZE;
+use ream_consensus_misc::{
+    checkpoint::Checkpoint,
+    constants::beacon::{SLOTS_PER_EPOCH, SYNC_COMMITTEE_SIZE},
+};
 use ream_light_client::finality_update::LightClientFinalityUpdate;
 use tokio::sync::RwLock;
 const LRU_CACHE_SIZE: usize = 64;
+// Every block carries a sidecar per column, so the seen set must hold at least a full block's
+// worth of indices or duplicates of its earlier columns are validated and imported again.
+const DATA_COLUMN_SIDECAR_CACHE_SIZE: usize = NUMBER_OF_COLUMNS as usize * SLOTS_PER_EPOCH as usize;
 const BLOCK_CACHE_SIZE: usize = 128;
 const STATE_CACHE_SIZE: usize = 8;
 
@@ -54,6 +61,14 @@ pub struct AggregateAndProofKey {
     pub target_epoch: u64,
 }
 
+/// A signed block header whose header-derived data column gossip checks all passed, keyed by the
+/// header root. The result only holds for the same signature and finalized checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDataColumnHeader {
+    pub signature: BLSSignature,
+    pub finalized_checkpoint: Checkpoint,
+}
+
 /// In-memory LRU cache for beacon node (gossip validation + beacon storage).
 #[derive(Debug)]
 pub struct BeaconCacheDB {
@@ -63,6 +78,7 @@ pub struct BeaconCacheDB {
         RwLock<LruCache<AddressSlotIdentifier, BLSToExecutionChange>>,
     pub seen_blob_sidecars: RwLock<LruCache<(u64, u64, u64), ()>>,
     pub seen_data_column_sidecars: RwLock<LruCache<(u64, u64, u64), ()>>,
+    pub validated_data_column_headers: RwLock<LruCache<B256, ValidatedDataColumnHeader>>,
     pub seen_attestations: RwLock<LruCache<AtestationKey, ()>>,
     pub seen_bls_to_execution_change: RwLock<LruCache<AddressValidaterIndexIdentifier, ()>>,
     pub seen_sync_messages: RwLock<LruCache<SyncCommitteeKey, ()>>,
@@ -95,6 +111,10 @@ impl BeaconCacheDB {
             )
             .into(),
             seen_data_column_sidecars: LruCache::new(
+                NonZeroUsize::new(DATA_COLUMN_SIDECAR_CACHE_SIZE).expect("Invalid cache size"),
+            )
+            .into(),
+            validated_data_column_headers: LruCache::new(
                 NonZeroUsize::new(LRU_CACHE_SIZE).expect("Invalid cache size"),
             )
             .into(),
