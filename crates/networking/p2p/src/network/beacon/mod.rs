@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use channel::{P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
+use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
 use discv5::Enr;
 use libp2p::{
@@ -31,7 +31,7 @@ use libp2p_identity::{Keypair, PublicKey, secp256k1};
 use network_state::NetworkState;
 use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
-use ream_consensus_misc::constants::beacon::genesis_validators_root;
+use ream_consensus_misc::constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root};
 use ream_discv5::discovery::{Discovery, DiscoveryOutEvent, QueryType};
 use ream_executor::ReamExecutor;
 use ream_metrics::set_peer_count;
@@ -43,7 +43,9 @@ use ream_req_resp::{
         BeaconRequestMessage, BeaconResponseMessage,
         blob_sidecars::BlobSidecarsByRootV1Request,
         blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request},
-        data_column_sidecars::DataColumnSidecarsByRootV1Request,
+        data_column_sidecars::{
+            DataColumnSidecarsByRangeV1Request, DataColumnSidecarsByRootV1Request,
+        },
         meta_data::GetMetaDataV3,
         ping::Ping,
         status::Status,
@@ -52,6 +54,7 @@ use ream_req_resp::{
     handler::{ReqRespMessageError, ReqRespMessageReceived, RespMessage},
     messages::{RequestMessage, ResponseMessage},
 };
+use ssz_types::VariableList;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::interval,
@@ -65,6 +68,15 @@ use crate::{
     gossipsub::{GossipsubBehaviour, beacon::topics::GossipTopic, snappy::SnappyTransform},
     network::misc::{Executor, build_transport, peer_id_from_enr},
 };
+
+fn status_is_plausible(status: &Status, current_epoch: u64) -> bool {
+    status.earliest_available_slot <= status.head_slot
+        && status.finalized_epoch <= current_epoch.saturating_add(1)
+        && status.head_slot
+            <= current_epoch
+                .saturating_add(2)
+                .saturating_mul(SLOTS_PER_EPOCH)
+}
 
 #[derive(NetworkBehaviour)]
 pub(crate) struct ReamBehaviour {
@@ -106,7 +118,7 @@ pub struct Network {
     peer_id: PeerId,
     swarm: Swarm<ReamBehaviour>,
     subscribed_topics: Arc<Mutex<HashSet<GossipTopic>>>,
-    callbacks: HashMapDelay<u64, mpsc::Sender<anyhow::Result<P2PCallbackResponse>>>,
+    callbacks: HashMapDelay<u64, mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>>,
     request_id: u64,
     network_state: Arc<NetworkState>,
     peers_to_ping: HashSetDelay<PeerId>,
@@ -364,6 +376,19 @@ impl Network {
                                     warn!("Failed to send error response: {err:?}");
                                 }
                             },
+                            P2PRequest::DataColumnRange { peer_id, start, count, columns, callback } => {
+                                let request = DataColumnSidecarsByRangeV1Request {
+                                    start_slot: start,
+                                    count,
+                                    columns: VariableList::new(columns)
+                                        .expect("Too many columns were requested"),
+                                };
+                                if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::DataColumnSidecarsByRange(request)) {
+                                    self.callbacks.insert(request_id, callback);
+                                } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {
+                                    warn!("Failed to send error response: {err:?}");
+                                }
+                            },
                             P2PRequest::DataColumnIdentifiers { peer_id, column_identifiers, callback } => {
                                 if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::DataColumnSidecarsByRoot(DataColumnSidecarsByRootV1Request::new(column_identifiers))) {
                                     self.callbacks.insert(request_id, callback);
@@ -438,7 +463,14 @@ impl Network {
                         }
                     }
 
-                    let peer_count = peer_table.len();
+                    let active_peer_count = counts
+                        .get(&ConnectionState::Connected)
+                        .copied()
+                        .unwrap_or_default()
+                        + counts
+                            .get(&ConnectionState::Connecting)
+                            .copied()
+                            .unwrap_or_default();
                     let peers_to_ping_count = self.peers_to_ping.len();
                     let seq_number = self.network_state.meta_data.read().seq_number;
 
@@ -450,8 +482,8 @@ impl Network {
                         warn!("Failed to update attestation subnet subscriptions: {err:?}");
                     }
 
-                    if peer_count < TARGET_PEER_COUNT {
-                        info!("Peer count is below target: {peer_count}, discovering more peers");
+                    if active_peer_count < TARGET_PEER_COUNT {
+                        info!("Active peer count is below target: {active_peer_count}, discovering more peers");
                         self.swarm
                             .behaviour_mut()
                             .discovery
@@ -671,9 +703,9 @@ impl Network {
         let message = match message {
             Ok(message) => message,
             Err(err) => {
-                if let ReqRespMessageError::Outbound { request_id, .. } = &err
-                    && let Some(callback) = self.callbacks.get(request_id)
-                    && let Err(err) = callback.send(Err(anyhow!("{err:?}"))).await
+                if let ReqRespMessageError::Outbound { request_id, err } = err
+                    && let Some(callback) = self.callbacks.remove(&request_id)
+                    && let Err(err) = callback.send(Err(P2PCallbackError::ReqResp(err))).await
                 {
                     warn!("Failed to send error response: {err:?}");
                 }
@@ -850,14 +882,19 @@ impl Network {
     fn handle_status_req_resp_event(&mut self, peer_id: PeerId, status: Status) {
         if self.network_state.peer_table.read().get(&peer_id).is_some() {
             // We only want to have peers on the same network as us
-            let fork_digest = beacon_network_spec().fork_digest(
-                beacon_network_spec().current_epoch(),
-                genesis_validators_root(),
-            );
+            let current_epoch = beacon_network_spec().current_epoch();
+            let fork_digest =
+                beacon_network_spec().fork_digest(current_epoch, genesis_validators_root());
             if status.fork_digest != fork_digest {
                 warn!(
                     "Peer {peer_id} is not on the same network as us, removing from peer table, fork_digest: {}, our fork_digest: {fork_digest}",
                     status.fork_digest,
+                );
+                self.network_state.peer_table.write().remove(&peer_id);
+            } else if !status_is_plausible(&status, current_epoch) {
+                warn!(
+                    "Peer {peer_id} sent an impossible Status (finalized_epoch={}, head_slot={}, earliest_available_slot={}), removing from peer table",
+                    status.finalized_epoch, status.head_slot, status.earliest_available_slot
                 );
                 self.network_state.peer_table.write().remove(&peer_id);
             } else {
@@ -940,6 +977,42 @@ mod tests {
         config::NetworkConfig,
         gossipsub::beacon::{configurations::GossipsubConfig, topics::GossipTopicKind},
     };
+
+    #[test]
+    fn status_sanity_rejects_impossible_history_and_future_progress() {
+        let current_epoch = 100;
+        assert!(status_is_plausible(
+            &Status {
+                finalized_epoch: 98,
+                head_slot: 100 * SLOTS_PER_EPOCH,
+                earliest_available_slot: 90 * SLOTS_PER_EPOCH,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+        assert!(!status_is_plausible(
+            &Status {
+                head_slot: 10,
+                earliest_available_slot: 11,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+        assert!(!status_is_plausible(
+            &Status {
+                finalized_epoch: current_epoch + 2,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+        assert!(!status_is_plausible(
+            &Status {
+                head_slot: (current_epoch + 3) * SLOTS_PER_EPOCH,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+    }
 
     async fn create_network(
         socket_address: IpAddr,

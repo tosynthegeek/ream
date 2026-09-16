@@ -12,6 +12,7 @@ version.workspace = true
 [features]
 default = []
 devnet5 = ["ream-storage/devnet5", "ream-p2p/devnet5"]
+test-utils = []
 
 [dependencies]
 alloy-primitives.workspace = true
@@ -31,6 +32,7 @@ ream-chain-beacon.workspace = true
 ream-consensus-beacon.workspace = true
 ream-consensus-misc.workspace = true
 ream-executor.workspace = true
+ream-fork-choice-beacon.workspace = true
 ream-network-spec.workspace = true
 ream-p2p.workspace = true
 ream-polynomial-commitments.workspace = true
@@ -38,8 +40,15 @@ ream-req-resp.workspace = true
 ream-storage.workspace = true
 
 [dev-dependencies]
+discv5.workspace = true
 kzg.workspace = true
+parking_lot.workspace = true
 ream-execution-rpc-types.workspace = true
+ream-operation-pool.workspace = true
+ream-peer.workspace = true
+ream-sync-committee-pool.workspace = true
+snap.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

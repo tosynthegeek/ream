@@ -66,6 +66,7 @@ impl RespMessage {
                 | ReqRespError::Anyhow(_)
                 | ReqRespError::IoError(_) => Some(ResponseCode::ServerError),
                 ReqRespError::InvalidData(_) => Some(ResponseCode::InvalidRequest),
+                ReqRespError::RemoteError { code, .. } => Some(*code),
                 ReqRespError::Disconnected
                 | ReqRespError::StreamTimedOut(_)
                 | ReqRespError::TokioTimedOut(_) => Some(ResponseCode::ResourceUnavailable),
@@ -224,7 +225,7 @@ impl ReqRespConnectionHandler {
         self.behaviour_events
             .push(HandlerEvent::Err(ReqRespMessageError::Outbound {
                 request_id: info.request_id,
-                err: ReqRespError::InvalidData(format!("Dial upgrade error: {error:?}")),
+                err: ReqRespError::RawError(format!("Dial upgrade error: {error:?}")),
             }));
     }
 

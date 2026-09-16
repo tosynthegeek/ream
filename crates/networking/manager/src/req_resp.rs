@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use libp2p::{PeerId, swarm::ConnectionId};
 use ream_consensus_beacon::{blob_sidecar::BlobIdentifier, data_column_sidecar::ColumnIdentifier};
+use ream_network_spec::networks::beacon::beacon_network_spec;
 use ream_p2p::network::beacon::network_state::NetworkState;
 use ream_req_resp::beacon::messages::{
     BeaconRequestMessage, BeaconResponseMessage,
@@ -50,16 +51,42 @@ pub async fn handle_req_resp_message(
             count,
             ..
         }) => {
-            for slot in start_slot..start_slot + count {
-                let Ok(Some(block_root)) = ream_db.slot_index_provider().get(slot) else {
-                    trace!("No block root found for slot {slot}");
-                    p2p_sender.send_error_response(
-                        peer_id,
-                        connection_id,
-                        stream_id,
-                        &format!("No block root found for slot {slot}"),
-                    );
-                    return;
+            let max_request_blocks = beacon_network_spec().max_request_blocks;
+            if count > max_request_blocks {
+                p2p_sender.send_invalid_request(
+                    peer_id,
+                    connection_id,
+                    stream_id,
+                    &format!("Requested count {count} exceeds maximum {max_request_blocks}"),
+                );
+                return;
+            }
+            let Some(end_slot_exclusive) = start_slot.checked_add(count) else {
+                p2p_sender.send_invalid_request(
+                    peer_id,
+                    connection_id,
+                    stream_id,
+                    &format!("start_slot {start_slot} + count {count} overflows"),
+                );
+                return;
+            };
+
+            for slot in start_slot..end_slot_exclusive {
+                let block_root = match ream_db.slot_index_provider().get(slot) {
+                    Ok(Some(block_root)) => block_root,
+                    Ok(None) => {
+                        trace!("No block root found for slot {slot}");
+                        continue;
+                    }
+                    Err(err) => {
+                        p2p_sender.send_error_response(
+                            peer_id,
+                            connection_id,
+                            stream_id,
+                            &format!("Failed to read slot index for slot {slot}: {err:?}"),
+                        );
+                        return;
+                    }
                 };
                 let Ok(Some(block)) = ream_db.block_provider().get(block_root) else {
                     trace!("No block found for root {block_root}");
@@ -109,16 +136,42 @@ pub async fn handle_req_resp_message(
             start_slot,
             count,
         }) => {
-            for slot in start_slot..start_slot + count {
-                let Ok(Some(block_root)) = ream_db.slot_index_provider().get(slot) else {
-                    trace!("No block root found for slot {slot}");
-                    p2p_sender.send_error_response(
-                        peer_id,
-                        connection_id,
-                        stream_id,
-                        &format!("No block root found for slot {slot}"),
-                    );
-                    return;
+            let max_request_blocks = beacon_network_spec().max_request_blocks_deneb;
+            if count > max_request_blocks {
+                p2p_sender.send_invalid_request(
+                    peer_id,
+                    connection_id,
+                    stream_id,
+                    &format!("Requested count {count} exceeds maximum {max_request_blocks}"),
+                );
+                return;
+            }
+            let Some(end_slot_exclusive) = start_slot.checked_add(count) else {
+                p2p_sender.send_invalid_request(
+                    peer_id,
+                    connection_id,
+                    stream_id,
+                    &format!("start_slot {start_slot} + count {count} overflows"),
+                );
+                return;
+            };
+
+            for slot in start_slot..end_slot_exclusive {
+                let block_root = match ream_db.slot_index_provider().get(slot) {
+                    Ok(Some(block_root)) => block_root,
+                    Ok(None) => {
+                        trace!("No block root found for slot {slot}");
+                        continue;
+                    }
+                    Err(err) => {
+                        p2p_sender.send_error_response(
+                            peer_id,
+                            connection_id,
+                            stream_id,
+                            &format!("Failed to read slot index for slot {slot}: {err:?}"),
+                        );
+                        return;
+                    }
                 };
                 let Ok(Some(block)) = ream_db.block_provider().get(block_root) else {
                     trace!("No block found for root {block_root}");
@@ -232,10 +285,42 @@ pub async fn handle_req_resp_message(
             count,
             columns,
         }) => {
-            for slot in start_slot..start_slot + count {
-                let Ok(Some(block_root)) = ream_db.slot_index_provider().get(slot) else {
-                    trace!("No block root found for slot {slot}");
-                    continue;
+            let max_request_blocks = beacon_network_spec().max_request_blocks_deneb;
+            if count > max_request_blocks {
+                p2p_sender.send_invalid_request(
+                    peer_id,
+                    connection_id,
+                    stream_id,
+                    &format!("Requested count {count} exceeds maximum {max_request_blocks}"),
+                );
+                return;
+            }
+            let Some(end_slot_exclusive) = start_slot.checked_add(count) else {
+                p2p_sender.send_invalid_request(
+                    peer_id,
+                    connection_id,
+                    stream_id,
+                    &format!("start_slot {start_slot} + count {count} overflows"),
+                );
+                return;
+            };
+
+            for slot in start_slot..end_slot_exclusive {
+                let block_root = match ream_db.slot_index_provider().get(slot) {
+                    Ok(Some(block_root)) => block_root,
+                    Ok(None) => {
+                        trace!("No block root found for slot {slot}");
+                        continue;
+                    }
+                    Err(err) => {
+                        p2p_sender.send_error_response(
+                            peer_id,
+                            connection_id,
+                            stream_id,
+                            &format!("Failed to read slot index for slot {slot}: {err:?}"),
+                        );
+                        return;
+                    }
                 };
 
                 for &column_index in &columns {

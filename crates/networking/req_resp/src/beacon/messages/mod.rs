@@ -8,6 +8,7 @@ pub mod status;
 
 use std::sync::Arc;
 
+use alloy_primitives::aliases::B32;
 use blob_sidecars::{BlobSidecarsByRangeV1Request, BlobSidecarsByRootV1Request};
 use blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request};
 use data_column_sidecars::{DataColumnSidecarsByRangeV1Request, DataColumnSidecarsByRootV1Request};
@@ -18,17 +19,15 @@ use ream_consensus_beacon::{
     blob_sidecar::BlobSidecar, data_column_sidecar::DataColumnSidecar,
     electra::beacon_block::SignedBeaconBlock,
 };
+use ream_consensus_misc::{
+    constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
+};
+use ream_network_spec::networks::beacon_network_spec;
 use ssz_derive::{Decode, Encode};
 use status::Status;
 
 use super::protocol_id::BeaconSupportedProtocol;
-use crate::{
-    constants::{
-        MAX_BLOBS_PER_BLOCK, MAX_REQUEST_BLOB_SIDECARS, MAX_REQUEST_BLOCKS,
-        MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN,
-    },
-    protocol_id::{ProtocolId, SupportedProtocol},
-};
+use crate::protocol_id::{ProtocolId, SupportedProtocol};
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[ssz(enum_behaviour = "transparent")]
@@ -100,6 +99,7 @@ impl BeaconRequestMessage {
     }
 
     pub fn max_response_chunks(&self) -> u64 {
+        let network_spec = beacon_network_spec();
         match self {
             BeaconRequestMessage::MetaData(_)
             | BeaconRequestMessage::Goodbye(_)
@@ -107,17 +107,29 @@ impl BeaconRequestMessage {
             | BeaconRequestMessage::Ping(_) => 1,
 
             BeaconRequestMessage::BeaconBlocksByRange(request) => {
-                request.count.min(MAX_REQUEST_BLOCKS)
+                request.count.min(network_spec.max_request_blocks)
             }
             BeaconRequestMessage::BeaconBlocksByRoot(request) => request.inner.len() as u64,
             BeaconRequestMessage::BlobSidecarsByRange(request) => {
-                (request.count * MAX_BLOBS_PER_BLOCK).min(MAX_REQUEST_BLOB_SIDECARS)
+                let max_blobs_per_block = network_spec
+                    .blob_schedule
+                    .iter()
+                    .map(|parameters| parameters.max_blobs_per_block)
+                    .max()
+                    .unwrap_or(network_spec.max_blobs_per_block_electra)
+                    .max(network_spec.max_blobs_per_block_electra);
+                request
+                    .count
+                    .min(network_spec.max_request_blocks_deneb)
+                    .saturating_mul(max_blobs_per_block)
             }
             BeaconRequestMessage::BlobSidecarsByRoot(request) => request.inner.len() as u64,
             BeaconRequestMessage::DataColumnSidecarsByRange(request) => {
                 let num_columns = request.columns.len() as u64;
-                (request.count * num_columns)
-                    .min(MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN * num_columns)
+                request
+                    .count
+                    .min(network_spec.max_request_blocks_deneb)
+                    .saturating_mul(num_columns)
             }
             BeaconRequestMessage::DataColumnSidecarsByRoot(request) => {
                 request.inner.iter().map(|id| id.columns.len() as u64).sum()
@@ -139,4 +151,26 @@ pub enum BeaconResponseMessage {
     BlobSidecarsByRoot(BlobSidecar),
     DataColumnSidecarsByRange(DataColumnSidecar),
     DataColumnSidecarsByRoot(DataColumnSidecar),
+}
+
+impl BeaconResponseMessage {
+    pub fn context_bytes(&self) -> Option<B32> {
+        let slot = match self {
+            Self::BeaconBlocksByRange(block) | Self::BeaconBlocksByRoot(block) => {
+                block.message.slot
+            }
+            Self::BlobSidecarsByRange(sidecar) | Self::BlobSidecarsByRoot(sidecar) => {
+                sidecar.signed_block_header.message.slot
+            }
+            Self::DataColumnSidecarsByRange(sidecar) | Self::DataColumnSidecarsByRoot(sidecar) => {
+                sidecar.signed_block_header.message.slot
+            }
+            Self::MetaData(_) | Self::Goodbye(_) | Self::Status(_) | Self::Ping(_) => return None,
+        };
+
+        Some(
+            beacon_network_spec()
+                .fork_digest(compute_epoch_at_slot(slot), genesis_validators_root()),
+        )
+    }
 }
