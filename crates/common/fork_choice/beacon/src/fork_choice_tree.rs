@@ -177,6 +177,17 @@ impl ForkChoiceTree {
         );
         self.update_node(block.root);
         self.update_ancestors(block.parent_root);
+
+        let carried_weight: u64 = self
+            .votes
+            .values()
+            .filter(|vote| vote.root == block.root)
+            .map(|vote| vote.balance)
+            .sum();
+        if carried_weight > 0 {
+            self.apply_weight_delta(block.root, i128::from(carried_weight));
+        }
+
         Ok(())
     }
 
@@ -516,6 +527,29 @@ mod tests {
         assert_eq!(tree.head(), root(3));
         assert_eq!(tree.weight(&root(2)), Some(0));
         assert_eq!(tree.weight(&root(3)), Some(96));
+    }
+
+    #[test]
+    fn a_vote_recorded_before_its_block_is_applied_once_the_block_arrives() {
+        let mut tree = tree_with_balances(4);
+
+        // The attestation for block 2 arrives (and is recorded) before block 2 itself does.
+        tree.process_votes([(0, root(2))]);
+        assert_eq!(tree.weight(&root(2)), None);
+        assert_eq!(tree.weight(&root(1)), Some(0));
+
+        // Block 2 arrives: the earlier vote's weight must land on it, not be dropped.
+        tree.insert(block(2, 1, 1)).unwrap();
+        assert_eq!(tree.weight(&root(2)), Some(32));
+        assert_eq!(tree.weight(&root(1)), Some(32));
+        assert_eq!(tree.head(), root(2));
+
+        // A second, later vote for the same still-unknown block 3 should carry over too.
+        tree.process_votes([(1, root(3))]);
+        tree.insert(block(3, 1, 1)).unwrap();
+        assert_eq!(tree.weight(&root(3)), Some(32));
+        // Tie on weight (32 vs 32) between root(2) and root(3) breaks towards the higher root.
+        assert_eq!(tree.head(), root(3));
     }
 
     #[test]
