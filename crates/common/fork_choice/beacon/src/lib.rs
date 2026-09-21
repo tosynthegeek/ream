@@ -1,4 +1,5 @@
 pub mod constants;
+pub mod fork_choice_tree;
 pub mod handlers;
 pub mod store;
 
