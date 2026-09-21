@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ream_consensus_beacon::fork_choice::latest_message::LatestMessage;
-use redb::{Database, Durability, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{
     errors::StoreError,
@@ -13,6 +13,20 @@ pub struct LatestMessagesTable {
 }
 
 impl LatestMessagesTable {
+    /// Returns every stored latest message as `(validator_index, message)` from a single read
+    /// transaction. Used to rebuild in-memory fork choice state on startup.
+    pub fn get_all(&self) -> Result<Vec<(u64, LatestMessage)>, StoreError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(Self::TABLE_DEFINITION)?;
+
+        let mut entries = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            entries.push((key.value(), value.value()));
+        }
+        Ok(entries)
+    }
+
     pub fn insert_batch(
         &self,
         entries: impl IntoIterator<Item = (u64, LatestMessage)>,
