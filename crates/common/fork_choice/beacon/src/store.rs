@@ -340,6 +340,9 @@ impl Store {
     /// proposer boost.
     pub fn refresh_fork_choice(&mut self) {
         let Some(mut tree) = self.fork_choice.take() else {
+            if let Err(err) = self.enable_fork_choice_tree() {
+                warn!("unable to re-enable the fork choice tree: {err:#}");
+            }
             return;
         };
         match self.reconcile_fork_choice_tree(&mut tree) {
@@ -738,6 +741,17 @@ impl Store {
         }
     }
 
+    fn weight(&self, root: B256) -> anyhow::Result<u64> {
+        match self
+            .fork_choice
+            .as_ref()
+            .and_then(|tree| tree.weight(&root))
+        {
+            Some(weight) => Ok(weight),
+            None => self.get_weight(root),
+        }
+    }
+
     pub fn is_head_weak(&self, head_root: B256) -> anyhow::Result<bool> {
         let justified_state = self
             .db
@@ -747,7 +761,7 @@ impl Store {
 
         let reorg_threshold =
             calculate_committee_fraction(&justified_state, REORG_HEAD_WEIGHT_THRESHOLD);
-        let head_weight = self.get_weight(head_root)?;
+        let head_weight = self.weight(head_root)?;
 
         Ok(head_weight < reorg_threshold)
     }
@@ -761,7 +775,7 @@ impl Store {
 
         let parent_threshold =
             calculate_committee_fraction(&justified_state, REORG_PARENT_WEIGHT_THRESHOLD);
-        let parent_weight = self.get_weight(parent_root)?;
+        let parent_weight = self.weight(parent_root)?;
 
         Ok(parent_weight > parent_threshold)
     }
