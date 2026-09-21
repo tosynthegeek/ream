@@ -6357,6 +6357,7 @@ dependencies = [
  "anyhow",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "parking_lot",
  "ream-consensus-beacon",
  "ream-consensus-misc",
  "ream-events-beacon",

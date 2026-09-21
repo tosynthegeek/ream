@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use alloy_primitives::B256;
-use anyhow::bail;
+use anyhow::anyhow;
+use parking_lot::RwLock;
 use ream_consensus_beacon::{
     attestation::Attestation,
     attester_slashing::AttesterSlashing,
     data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
-    electra::beacon_block::SignedBeaconBlock,
+    electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
 };
 use ream_consensus_misc::{
-    constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
+    checkpoint::Checkpoint, constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
 };
 use ream_events_beacon::{BeaconEvent, BeaconEventSender, event::chain::BlockEvent};
 use ream_execution_engine::ExecutionEngine;
@@ -56,9 +57,36 @@ pub enum BlockImportEvent {
     PendingAvailability { block_root: B256 },
 }
 
+#[derive(Debug, Clone)]
+pub struct CachedHead {
+    pub head_root: B256,
+    /// Slot of the head block.
+    pub head_slot: u64,
+    /// Post-state of the head block. Clone the value out of the `Arc` if it must be mutated.
+    pub state: Arc<BeaconState>,
+    /// Wall-clock slot as tracked by the store.
+    pub current_slot: u64,
+    pub justified_checkpoint: Checkpoint,
+    pub finalized_checkpoint: Checkpoint,
+}
+
+impl CachedHead {
+    /// Whether two snapshots describe the same chain view. The state is not compared: it is a
+    /// function of `head_root`.
+    fn is_equivalent(&self, other: &Self) -> bool {
+        self.head_root == other.head_root
+            && self.current_slot == other.current_slot
+            && self.justified_checkpoint == other.justified_checkpoint
+            && self.finalized_checkpoint == other.finalized_checkpoint
+    }
+}
+
 /// BeaconChain is the main struct which manages the nodes local beacon chain.
 pub struct BeaconChain {
     pub store: Mutex<Store>,
+    pub cached_head: RwLock<Option<CachedHead>>,
+    db: BeaconDB,
+    operation_pool: Arc<OperationPool>,
     pub execution_engine: Option<ExecutionEngine>,
     pub event_sender: Option<broadcast::Sender<BeaconEvent>>,
     block_import_sender: broadcast::Sender<BlockImportEvent>,
@@ -77,14 +105,52 @@ impl BeaconChain {
     ) -> Self {
         let (block_import_sender, _) = broadcast::channel(BLOCK_IMPORT_EVENT_CHANNEL_CAPACITY);
 
+        let read_db = db.clone();
+        let read_operation_pool = operation_pool.clone();
+        let mut store = Store::new(db, operation_pool, Some(sync_committee_pool));
+        if let Err(err) = store.enable_fork_choice_tree() {
+            warn!(
+                "Could not build the fork choice tree from the database, head lookups will be \
+                 slow: {err:#}"
+            );
+        }
+        let cached_head = match Self::compute_cached_head(&store, None) {
+            Ok(head) => Some(head),
+            Err(err) => {
+                debug!("No head to cache yet: {err:#}");
+                None
+            }
+        };
+
         Self {
-            store: Mutex::new(Store::new(db, operation_pool, Some(sync_committee_pool))),
+            store: Mutex::new(store),
+            cached_head: RwLock::new(cached_head),
+            db: read_db,
+            operation_pool: read_operation_pool,
             execution_engine,
             event_sender,
             block_import_sender,
             execution_forkchoice: Mutex::new(None),
             force_data_availability_checks: false,
         }
+    }
+
+    /// Returns the current head snapshot without touching the store lock.
+    pub fn head(&self) -> anyhow::Result<CachedHead> {
+        self.cached_head
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow!("Head is not available yet: no anchor block in the database"))
+    }
+
+    /// Database handle for lock-free reads. redb serves readers from consistent snapshots, so
+    /// these never wait for the store lock.
+    pub fn db(&self) -> &BeaconDB {
+        &self.db
+    }
+
+    pub fn operation_pool(&self) -> &Arc<OperationPool> {
+        &self.operation_pool
     }
 
     /// Enables data availability checks independently of the configured Fulu fork epoch.
@@ -140,6 +206,8 @@ impl BeaconChain {
         }
 
         self.process_block_attestations(&mut store, &signed_block);
+        store.refresh_fork_choice();
+        self.publish_cached_head(&store);
         let block_event = self.build_block_event(&store, &signed_block);
         drop(store);
 
@@ -239,15 +307,15 @@ impl BeaconChain {
         let block_root = signed_block.message.tree_hash_root();
         process_available_block(store, pending)?;
         self.process_block_attestations(store, &signed_block);
+        store.refresh_fork_choice();
+        self.publish_cached_head(store);
         let block_event = self.build_block_event(store, &signed_block);
         Ok((block_root, block_event))
     }
 
     /// Returns zero when the beacon block has no known execution payload.
-    fn execution_block_hash(store: &Store, block_root: B256) -> B256 {
-        store
-            .db
-            .block_provider()
+    fn execution_block_hash(db: &BeaconDB, block_root: B256) -> B256 {
+        db.block_provider()
             .get(block_root)
             .ok()
             .flatten()
@@ -256,20 +324,21 @@ impl BeaconChain {
     }
 
     /// Translates consensus fork choice into Engine API block hashes.
-    fn build_forkchoice_state(&self, store: &Store) -> Option<ForkchoiceStateV1> {
+    fn build_forkchoice_state(&self) -> Option<ForkchoiceStateV1> {
         self.execution_engine.as_ref()?;
 
-        let head_root = store
-            .get_head()
+        let head = self
+            .head()
             .inspect_err(|err| warn!("Failed to read head for forkchoice update: {err}"))
             .ok()?;
-        let justified_root = store.db.justified_checkpoint_provider().get().ok()?.root;
-        let finalized_root = store.db.finalized_checkpoint_provider().get().ok()?.root;
 
         Some(ForkchoiceStateV1 {
-            head_block_hash: Self::execution_block_hash(store, head_root),
-            safe_block_hash: Self::execution_block_hash(store, justified_root),
-            finalized_block_hash: Self::execution_block_hash(store, finalized_root),
+            head_block_hash: Self::execution_block_hash(&self.db, head.head_root),
+            safe_block_hash: Self::execution_block_hash(&self.db, head.justified_checkpoint.root),
+            finalized_block_hash: Self::execution_block_hash(
+                &self.db,
+                head.finalized_checkpoint.root,
+            ),
         })
     }
 
@@ -284,11 +353,9 @@ impl BeaconChain {
         if last_forkchoice.is_none() && !allow_initial_update {
             return;
         }
-        let forkchoice_state = {
-            let store = self.store.lock().await;
-            self.build_forkchoice_state(&store)
-        };
-        let Some(forkchoice_state) = forkchoice_state else {
+        // The cached head is published under the store lock at the end of every writer, so it is
+        // as current as anything the store lock would give us, without waiting for it.
+        let Some(forkchoice_state) = self.build_forkchoice_state() else {
             return;
         };
         if last_forkchoice.as_ref() == Some(&forkchoice_state) {
@@ -364,6 +431,7 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attester_slashing(&mut store, attester_slashing)?;
+        self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;
         Ok(())
@@ -376,6 +444,7 @@ impl BeaconChain {
     ) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_attestation(&mut store, attestation, is_from_block)?;
+        self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;
         Ok(())
@@ -384,48 +453,78 @@ impl BeaconChain {
     pub async fn process_tick(&self, time: u64) -> anyhow::Result<()> {
         let mut store = self.store.lock().await;
         on_tick(&mut store, time)?;
+        self.publish_cached_head(&store);
         drop(store);
         self.update_execution_forkchoice(false).await;
         Ok(())
     }
 
     pub async fn build_status_request(&self) -> anyhow::Result<Status> {
-        let Ok(finalized_checkpoint) = self
-            .store
-            .lock()
-            .await
-            .db
-            .finalized_checkpoint_provider()
-            .get()
-        else {
-            bail!("Failed to get finalized checkpoint");
-        };
-
-        let head_root = match self.store.lock().await.get_head() {
-            Ok(head) => head,
-            Err(err) => {
-                warn!("Failed to get head root: {err}, falling back to finalized root");
-                finalized_checkpoint.root
-            }
-        };
-
-        let head_slot = match self.store.lock().await.db.block_provider().get(head_root) {
-            Ok(Some(block)) => block.message.slot,
-            err => {
-                bail!("Failed to get block for head root {head_root}: {err:?}");
-            }
-        };
+        let head = self.head()?;
 
         Ok(Status {
             fork_digest: beacon_network_spec().fork_digest(
                 beacon_network_spec().current_epoch(),
                 genesis_validators_root(),
             ),
-            finalized_root: finalized_checkpoint.root,
-            finalized_epoch: finalized_checkpoint.epoch,
+            finalized_root: head.finalized_checkpoint.root,
+            finalized_epoch: head.finalized_checkpoint.epoch,
+            head_root: head.head_root,
+            head_slot: head.head_slot,
+            earliest_available_slot: 0,
+        })
+    }
+
+    /// Recomputes the head snapshot from `store` and swaps it in. Writers call this as their last
+    /// step, after the store mutation is committed and while still holding the store guard, which
+    /// keeps publications ordered like the mutations.
+    fn publish_cached_head(&self, store: &Store) {
+        let previous = self.cached_head.read().clone();
+        match Self::compute_cached_head(store, previous.as_ref()) {
+            Ok(head) => {
+                if previous
+                    .as_ref()
+                    .is_none_or(|previous| !previous.is_equivalent(&head))
+                {
+                    *self.cached_head.write() = Some(head);
+                }
+            }
+            Err(err) => warn!("Failed to refresh the cached head: {err:#}"),
+        }
+    }
+
+    /// Reads the head from the store. The state is only reloaded when the head block changed.
+    fn compute_cached_head(
+        store: &Store,
+        previous: Option<&CachedHead>,
+    ) -> anyhow::Result<CachedHead> {
+        let head_root = store.get_head()?;
+
+        let (state, head_slot) = match previous.filter(|previous| previous.head_root == head_root) {
+            Some(previous) => (previous.state.clone(), previous.head_slot),
+            None => {
+                let state =
+                    store.db.state_provider().get(head_root)?.ok_or_else(|| {
+                        anyhow!("No beacon state found for head root: {head_root}")
+                    })?;
+                let head_slot = store
+                    .db
+                    .block_provider()
+                    .get(head_root)?
+                    .ok_or_else(|| anyhow!("No beacon block found for head root: {head_root}"))?
+                    .message
+                    .slot;
+                (Arc::new(state), head_slot)
+            }
+        };
+
+        Ok(CachedHead {
             head_root,
             head_slot,
-            earliest_available_slot: 0,
+            state,
+            current_slot: store.get_current_slot()?,
+            justified_checkpoint: store.db.justified_checkpoint_provider().get()?,
+            finalized_checkpoint: store.db.finalized_checkpoint_provider().get()?,
         })
     }
 }
