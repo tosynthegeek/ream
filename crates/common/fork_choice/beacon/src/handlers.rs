@@ -123,6 +123,7 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
     let signed_block = pending.signed_block;
     let block_root = signed_block.message.tree_hash_root();
     let block_slot = signed_block.message.slot;
+    let parent_root = signed_block.message.parent_root;
     let state: BeaconState = pending.post_state;
 
     BEACON_PROCESSED_DEPOSITS_TOTAL.set(state.eth1_deposit_index as i64);
@@ -164,6 +165,15 @@ pub fn process_available_block(store: &mut Store, pending: PendingBlock) -> anyh
 
     // Eagerly compute unrealized justification and finality.
     store.compute_pulled_up_tip(block_root)?;
+
+    // Fork choice tree maintenance is the last step, once the store mutation is committed.
+    store.fork_choice_insert_block(
+        block_root,
+        parent_root,
+        block_slot,
+        state.current_justified_checkpoint,
+    );
+    store.refresh_fork_choice();
 
     Ok(())
 }
@@ -207,7 +217,11 @@ pub fn on_attester_slashing(
         Err(err) => return Err(err.into()),
     };
 
-    for index in attestation_1_indices.intersection(&attestation_2_indices) {
+    let newly_equivocating = attestation_1_indices
+        .intersection(&attestation_2_indices)
+        .copied()
+        .collect::<Vec<_>>();
+    for index in &newly_equivocating {
         equivocating.insert(*index);
     }
 
@@ -215,6 +229,7 @@ pub fn on_attester_slashing(
         .db
         .equivocating_indices_provider()
         .insert(equivocating)?;
+    store.fork_choice_mark_equivocating(newly_equivocating);
 
     Ok(())
 }
