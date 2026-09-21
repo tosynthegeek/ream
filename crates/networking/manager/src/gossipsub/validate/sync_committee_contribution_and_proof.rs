@@ -29,7 +29,7 @@ pub async fn validate_sync_committee_contribution_and_proof(
     let head = beacon_chain.head()?;
     let state = head.state.as_ref();
 
-    let current_slot: u64 = head.head_slot;
+    let current_slot: u64 = head.current_slot;
 
     // [IGNORE] if contribution.slot is equal to or earlier than the current_slot (with a
     // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)

@@ -25,13 +25,11 @@ pub async fn validate_aggregate_and_proof(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    // A cheap read of the published head; everything below runs off-lock. Block lookups go
-    // straight to the database, which serves readers without the store lock.
     let head = beacon_chain.head()?;
     let db = beacon_chain.db();
     let state = head.state.as_ref();
 
-    let current_slot = head.head_slot;
+    let current_slot = head.current_slot;
     let aggregate_and_proof = &signed_aggregate_and_proof.message;
     let attestation = &aggregate_and_proof.aggregate;
     let attestation_slot = attestation.data.slot;
