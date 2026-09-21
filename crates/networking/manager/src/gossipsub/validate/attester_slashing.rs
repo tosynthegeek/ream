@@ -1,11 +1,10 @@
 use std::collections::HashSet;
 
-use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     attester_slashing::AttesterSlashing, electra::beacon_state::BeaconState,
 };
-use ream_storage::{cache::BeaconCacheDB, tables::table::REDBTable};
+use ream_storage::cache::BeaconCacheDB;
 
 use super::result::ValidationResult;
 
@@ -14,13 +13,9 @@ pub async fn validate_attester_slashing(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
-    let head_root = store.get_head()?;
-    let mut state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("Could not get beacon state: {head_root}"))?;
+    // `process_attester_slashing` mutates the state, so work on an owned copy of the cached head
+    // state; the store lock is not involved.
+    let mut state = BeaconState::clone(&beacon_chain.head()?.state);
 
     let slashed_indices = attester_slashing
         .attestation_1

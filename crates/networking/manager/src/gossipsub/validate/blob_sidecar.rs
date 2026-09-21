@@ -1,9 +1,9 @@
-use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::{blob_sidecar::BlobSidecar, electra::beacon_state::BeaconState};
+use ream_consensus_beacon::blob_sidecar::BlobSidecar;
 use ream_consensus_misc::{
     constants::beacon::MAX_BLOBS_PER_BLOCK_ELECTRA, misc::compute_start_slot_at_epoch,
 };
+use ream_fork_choice_beacon::store::{get_checkpoint_block_from_db, get_current_slot_from_db};
 use ream_polynomial_commitments::handlers::verify_blob_kzg_proof_batch;
 use ream_storage::{
     cache::BeaconCacheDB,
@@ -34,16 +34,18 @@ pub async fn validate_blob_sidecar(
     }
 
     let header = &blob_sidecar.signed_block_header.message;
-    let store = beacon_chain.store.lock().await;
+    // Everything below reads the database or the published head, never the store lock. In
+    // particular the KZG batch verification no longer runs while holding it.
+    let db = beacon_chain.db();
 
     // [IGNORE] The sidecar is not from a future slot
-    if header.slot > store.get_current_slot()? {
+    if header.slot > get_current_slot_from_db(db)? {
         return Ok(ValidationResult::Ignore(
             "The sidecar is from a future slot".to_string(),
         ));
     }
 
-    let finalized_checkpoint = store.db.finalized_checkpoint_provider().get()?;
+    let finalized_checkpoint = db.finalized_checkpoint_provider().get()?;
 
     // [IGNORE] The sidecar is from a slot greater than the latest finalized slot
     if header.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
@@ -52,12 +54,8 @@ pub async fn validate_blob_sidecar(
         ));
     }
 
-    let head_root = store.get_head()?;
-    let state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
+    let head = beacon_chain.head()?;
+    let state = head.state.as_ref();
 
     // [REJECT] The proposer signature of blob_sidecar.signed_block_header, is valid with respect to
     // the block_header.proposer_index pubkey.
@@ -68,7 +66,7 @@ pub async fn validate_blob_sidecar(
     }
 
     // [IGNORE] The sidecar's block's parent (defined by block_header.parent_root) has been seen
-    let Some(parent_block) = store.db.block_provider().get(header.parent_root)? else {
+    let Some(parent_block) = db.block_provider().get(header.parent_root)? else {
         return Ok(ValidationResult::Ignore(
             "Parent block not seen".to_string(),
         ));
@@ -85,7 +83,7 @@ pub async fn validate_blob_sidecar(
     }
 
     // [REJECT] The current finalized_checkpoint is an ancestor of the sidecar's block
-    if store.get_checkpoint_block(header.parent_root, finalized_checkpoint.epoch)?
+    if get_checkpoint_block_from_db(db, header.parent_root, finalized_checkpoint.epoch)?
         != finalized_checkpoint.root
     {
         return Ok(ValidationResult::Reject(

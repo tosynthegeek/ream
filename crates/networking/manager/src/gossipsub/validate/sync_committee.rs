@@ -1,15 +1,11 @@
 use anyhow::anyhow;
 use ream_bls::traits::Verifiable;
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
     constants::beacon::DOMAIN_SYNC_COMMITTEE,
     misc::{compute_epoch_at_slot, compute_signing_root},
 };
-use ream_storage::{
-    cache::{BeaconCacheDB, SyncCommitteeKey},
-    tables::table::REDBTable,
-};
+use ream_storage::cache::{BeaconCacheDB, SyncCommitteeKey};
 use ream_validator_beacon::sync_committee::{
     SyncCommitteeMessage, compute_subnets_for_sync_committee,
 };
@@ -22,25 +18,20 @@ pub async fn validate_sync_committee(
     subnet_id: u64,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
-
-    let head_root = store.get_head()?;
-    let state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
+    // A cheap read of the published head; everything below runs off-lock on the owned snapshot.
+    let head = beacon_chain.head()?;
+    let state = head.state.as_ref();
 
     // [IGNORE] The message's slot is for the current slot (with a MAXIMUM_GOSSIP_CLOCK_DISPARITY
     // allowance)
-    if message.slot != store.get_current_slot()? {
+    if message.slot != head.current_slot {
         return Ok(ValidationResult::Ignore(
             "Message is not from current slot".into(),
         ));
     }
 
     // [REJECT] The subnet_id is valid for the given validator
-    if !compute_subnets_for_sync_committee(&state, message.validator_index)?.contains(&subnet_id) {
+    if !compute_subnets_for_sync_committee(state, message.validator_index)?.contains(&subnet_id) {
         return Ok(ValidationResult::Reject(
             "Validator not in correct sync subcommittee".into(),
         ));

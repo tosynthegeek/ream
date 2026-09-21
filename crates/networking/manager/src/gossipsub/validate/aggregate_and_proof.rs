@@ -1,13 +1,13 @@
 use anyhow::anyhow;
 use ream_bls::{PublicKey, traits::Verifiable};
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
     constants::beacon::{
         ATTESTATION_PROPAGATION_SLOT_RANGE, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER,
     },
     misc::{compute_epoch_at_slot, compute_signing_root, get_committee_indices},
 };
+use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_storage::{
     cache::{AggregateAndProofKey, BeaconCacheDB},
@@ -25,22 +25,13 @@ pub async fn validate_aggregate_and_proof(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
+    // A cheap read of the published head; everything below runs off-lock. Block lookups go
+    // straight to the database, which serves readers without the store lock.
+    let head = beacon_chain.head()?;
+    let db = beacon_chain.db();
+    let state = head.state.as_ref();
 
-    let head_root = store.get_head()?;
-    let state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
-
-    let block = store
-        .db
-        .block_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("Could not get block for head root: {head_root}"))?;
-
-    let current_slot = block.message.slot;
+    let current_slot = head.head_slot;
     let aggregate_and_proof = &signed_aggregate_and_proof.message;
     let attestation = &aggregate_and_proof.aggregate;
     let attestation_slot = attestation.data.slot;
@@ -288,8 +279,7 @@ pub async fn validate_aggregate_and_proof(
     // [IGNORE] The block being voted for (aggregate.data.beacon_block_root) has been seen (via
     // gossip or non-gossip sources) (a client MAY queue aggregates for processing once block is
     // retrieved).
-    if store
-        .db
+    if db
         .block_provider()
         .get(attestation.data.beacon_block_root)?
         .is_none()
@@ -305,7 +295,8 @@ pub async fn validate_aggregate_and_proof(
     // [REJECT] The aggregate attestation's target block is an ancestor of the block named in the
     // LMD vote i.e., get_checkpoint_block(store, aggregate.data.beacon_block_root,
     // aggregate.data.target.epoch) == aggregate.data.target.root
-    if store.get_checkpoint_block(
+    if get_checkpoint_block_from_db(
+        db,
         attestation.data.beacon_block_root,
         attestation.data.target.epoch,
     )? != attestation.data.target.root

@@ -7,10 +7,7 @@ use ream_consensus_misc::{
     misc::{compute_epoch_at_slot, compute_signing_root, compute_sync_committee_period},
 };
 use ream_events_beacon::contribution_and_proof::SignedContributionAndProof;
-use ream_storage::{
-    cache::{BeaconCacheDB, CacheSyncCommitteeContribution, SyncCommitteeKey},
-    tables::table::REDBTable,
-};
+use ream_storage::cache::{BeaconCacheDB, CacheSyncCommitteeContribution, SyncCommitteeKey};
 use ream_validator_beacon::{
     constants::{
         DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
@@ -29,22 +26,10 @@ pub async fn validate_sync_committee_contribution_and_proof(
     let contribution_and_proof = &signed_contribution_and_proof.message;
     let contribution = &contribution_and_proof.contribution;
 
-    let store = beacon_chain.store.lock().await;
-    let head_root = store.get_head()?;
+    let head = beacon_chain.head()?;
+    let state = head.state.as_ref();
 
-    let block = store
-        .db
-        .block_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("Could not get block for head root: {head_root}"))?;
-
-    let state = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
-
-    let current_slot: u64 = block.message.slot;
+    let current_slot: u64 = head.head_slot;
 
     // [IGNORE] if contribution.slot is equal to or earlier than the current_slot (with a
     // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)
@@ -84,7 +69,7 @@ pub async fn validate_sync_committee_contribution_and_proof(
         .public_key;
 
     let is_valid_committee_member =
-        get_sync_subcommittee_pubkeys(&state, contribution.subcommittee_index)
+        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index)
             .contains(validator_pubkey);
 
     if !is_valid_committee_member {
@@ -172,7 +157,7 @@ pub async fn validate_sync_committee_contribution_and_proof(
     // pubkey
 
     let sync_committee_validators =
-        get_sync_subcommittee_pubkeys(&state, contribution.subcommittee_index);
+        get_sync_subcommittee_pubkeys(state, contribution.subcommittee_index);
 
     let is_sync_committee_valid = contribution.signature.fast_aggregate_verify(
         sync_committee_validators

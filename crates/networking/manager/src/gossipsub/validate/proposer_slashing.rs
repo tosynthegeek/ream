@@ -1,9 +1,8 @@
-use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     electra::beacon_state::BeaconState, proposer_slashing::ProposerSlashing,
 };
-use ream_storage::{cache::BeaconCacheDB, tables::table::REDBTable};
+use ream_storage::cache::BeaconCacheDB;
 
 use super::result::ValidationResult;
 
@@ -27,13 +26,9 @@ pub async fn validate_proposer_slashing(
         ));
     }
 
-    let store = beacon_chain.store.lock().await;
-    let head_root = store.get_head()?;
-    let mut state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("Could not get beacon state: {head_root}"))?;
+    // `process_proposer_slashing` mutates the state, so work on an owned copy of the cached head
+    // state; the store lock is not involved.
+    let mut state = BeaconState::clone(&beacon_chain.head()?.state);
 
     // [REJECT] All of the conditions within process_proposer_slashing pass validation
     if let Err(err) = state.process_proposer_slashing(proposer_slashing) {

@@ -1,10 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_light_client::optimistic_update::LightClientOptimisticUpdate;
 use ream_network_spec::networks::{beacon_network_spec, lean_network_spec};
-use ream_storage::{cache::BeaconCacheDB, tables::table::REDBTable};
+use ream_storage::cache::BeaconCacheDB;
 
 use crate::gossipsub::validate::result::ValidationResult;
 
@@ -13,13 +12,8 @@ pub async fn validate_light_client_optimistic_update(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
-    let head_root = store.get_head()?;
-    let _state = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("Could not get beacon state: {head_root}"))?;
+    // The head state is not needed, but an available head is still a precondition for validating.
+    let _head = beacon_chain.head()?;
 
     let signature_slot_start_time = lean_network_spec().genesis_time
         + (light_client_optimistic_update

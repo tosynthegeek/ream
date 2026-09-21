@@ -1,9 +1,6 @@
-use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
-use ream_consensus_beacon::{
-    electra::beacon_state::BeaconState, voluntary_exit::SignedVoluntaryExit,
-};
-use ream_storage::{cache::BeaconCacheDB, tables::table::REDBTable};
+use ream_consensus_beacon::voluntary_exit::SignedVoluntaryExit;
+use ream_storage::cache::BeaconCacheDB;
 
 use super::result::ValidationResult;
 
@@ -12,14 +9,8 @@ pub async fn validate_voluntary_exit(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
-
-    let head_root = store.get_head()?;
-    let state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
+    let head = beacon_chain.head()?;
+    let state = head.state.as_ref();
 
     // [IGNORE] The voluntary exit is the first valid voluntary exit received for the validator with
     // index signed_voluntary_exit.message.validator_index

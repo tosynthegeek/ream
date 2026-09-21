@@ -1,11 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::anyhow;
 pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier, data_column_sidecar::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
-    single_attestation::SingleAttestation,
+    electra::beacon_state::BeaconState, single_attestation::SingleAttestation,
 };
 use ream_consensus_misc::constants::beacon::{
     MIN_ATTESTATION_INCLUSION_DELAY, genesis_validators_root,
@@ -20,10 +19,7 @@ use ream_p2p::{
     },
     network::beacon::channel::GossipMessage,
 };
-use ream_storage::{
-    cache::BeaconCacheDB,
-    tables::table::{CustomTable, REDBTable},
-};
+use ream_storage::{cache::BeaconCacheDB, tables::table::CustomTable};
 use ream_validator_beacon::{
     attestation::single_attestation_to_attestation, blob_sidecars::compute_subnet_for_blob_sidecar,
     constants::SYNC_COMMITTEE_SUBNET_COUNT,
@@ -145,29 +141,23 @@ async fn import_gossip_attestation(
     beacon_chain: &BeaconChain,
     single_attestation: &SingleAttestation,
 ) -> anyhow::Result<()> {
-    let (attestation, should_process_attestation) = {
-        let store = beacon_chain.store.lock().await;
-        let head_root = store.get_head()?;
-        let mut state = store
-            .db
-            .state_provider()
-            .get(head_root)?
-            .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
-        if state.slot < single_attestation.data.slot {
-            state.process_slots(single_attestation.data.slot)?;
-        }
-        let attestation = single_attestation_to_attestation(single_attestation, &state)?;
-
-        store
-            .operation_pool
-            .insert_attestation(attestation.clone(), single_attestation.committee_index);
-
-        let current_slot = store.get_current_slot()?;
-        (
-            attestation,
-            current_slot >= single_attestation.data.slot + MIN_ATTESTATION_INCLUSION_DELAY,
-        )
+    // Nothing here needs the store lock: the head snapshot is published by the writers and the
+    // operation pool is independently synchronized.
+    let head = beacon_chain.head()?;
+    let attestation = if head.state.slot < single_attestation.data.slot {
+        let mut state = BeaconState::clone(&head.state);
+        state.process_slots(single_attestation.data.slot)?;
+        single_attestation_to_attestation(single_attestation, &state)?
+    } else {
+        single_attestation_to_attestation(single_attestation, &head.state)?
     };
+
+    beacon_chain
+        .operation_pool()
+        .insert_attestation(attestation.clone(), single_attestation.committee_index);
+
+    let should_process_attestation =
+        head.current_slot >= single_attestation.data.slot + MIN_ATTESTATION_INCLUSION_DELAY;
 
     if should_process_attestation {
         beacon_chain.process_attestation(attestation, false).await?;
@@ -531,23 +521,16 @@ pub async fn handle_gossipsub_message(
                     Ok(validation_result) => match validation_result {
                         ValidationResult::Accept => {
                             let blob_sidecar_bytes = blob_sidecar.as_ssz_bytes();
-                            if let Err(err) = beacon_chain
-                                .store
-                                .lock()
-                                .await
-                                .db
-                                .blobs_and_proofs_provider()
-                                .insert(
-                                    BlobIdentifier::new(
-                                        blob_sidecar.signed_block_header.message.tree_hash_root(),
-                                        blob_sidecar.index,
-                                    ),
-                                    BlobAndProofV1 {
-                                        blob: blob_sidecar.blob,
-                                        proof: blob_sidecar.kzg_proof,
-                                    },
-                                )
-                            {
+                            if let Err(err) = beacon_chain.db().blobs_and_proofs_provider().insert(
+                                BlobIdentifier::new(
+                                    blob_sidecar.signed_block_header.message.tree_hash_root(),
+                                    blob_sidecar.index,
+                                ),
+                                BlobAndProofV1 {
+                                    blob: blob_sidecar.blob,
+                                    proof: blob_sidecar.kzg_proof,
+                                },
+                            ) {
                                 error!("Failed to insert blob_sidecar: {err}");
                             }
 

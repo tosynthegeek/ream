@@ -1,13 +1,9 @@
-use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
     bls_to_execution_change::SignedBLSToExecutionChange, electra::beacon_state::BeaconState,
 };
 use ream_network_spec::networks::beacon_network_spec;
-use ream_storage::{
-    cache::{AddressValidaterIndexIdentifier, BeaconCacheDB},
-    tables::table::REDBTable,
-};
+use ream_storage::cache::{AddressValidaterIndexIdentifier, BeaconCacheDB};
 
 use super::result::ValidationResult;
 
@@ -16,14 +12,9 @@ pub async fn validate_bls_to_execution_change(
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
-
-    let head_root = store.get_head()?;
-    let mut state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
+    // `process_bls_to_execution_change` mutates the state, so work on an owned copy of the cached
+    // head state; the store lock is not involved.
+    let mut state = BeaconState::clone(&beacon_chain.head()?.state);
 
     // [IGNORE] current_epoch >= CAPELLA_FORK_EPOCH, where current_epoch is defined by the current
     // wall-clock time.

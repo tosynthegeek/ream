@@ -1174,6 +1174,39 @@ pub fn get_forkchoice_store(
     Ok(store)
 }
 
+pub fn get_slots_since_genesis_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
+    Ok(db
+        .time_provider()
+        .get()?
+        .saturating_sub(db.genesis_time_provider().get()?)
+        / beacon_network_spec().seconds_per_slot())
+}
+
+pub fn get_current_slot_from_db(db: &BeaconDB) -> anyhow::Result<u64> {
+    Ok(GENESIS_SLOT + get_slots_since_genesis_from_db(db)?)
+}
+
+/// Finds the ancestor of `root` at or before `slot` using only database reads, so callers that do
+/// not hold the [`Store`] can walk ancestry.
+pub fn get_ancestor_from_db(db: &BeaconDB, mut root: B256, slot: u64) -> anyhow::Result<B256> {
+    loop {
+        let block = db
+            .block_provider()
+            .get(root)?
+            .ok_or(anyhow!("Failed to find beacon_block_provider()"))?
+            .message;
+        if block.slot > slot {
+            root = block.parent_root;
+        } else {
+            return Ok(root);
+        }
+    }
+}
+
+pub fn get_checkpoint_block_from_db(db: &BeaconDB, root: B256, epoch: u64) -> anyhow::Result<B256> {
+    get_ancestor_from_db(db, root, compute_start_slot_at_epoch(epoch))
+}
+
 pub fn compute_slots_since_epoch_start(slot: u64) -> u64 {
     slot - compute_start_slot_at_epoch(compute_epoch_at_slot(slot))
 }

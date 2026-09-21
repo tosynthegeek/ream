@@ -4,13 +4,18 @@ use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_sta
 use ream_consensus_misc::{
     constants::beacon::MAX_BLOBS_PER_BLOCK_ELECTRA, misc::compute_start_slot_at_epoch,
 };
+#[cfg(not(feature = "disable_ancestor_validation"))]
+use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
+use ream_fork_choice_beacon::store::get_current_slot_from_db;
 use ream_storage::{
     cache::{AddressSlotIdentifier, BeaconCacheDB},
-    tables::{field::REDBField, table::REDBTable},
+    tables::field::REDBField,
 };
-use tree_hash::TreeHash;
 
-use super::result::{DependencyValidationResult, ValidationResult};
+use super::{
+    parent::{ParentBlock, find_parent},
+    result::{DependencyValidationResult, ValidationResult},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GossipValidatedBlock {
@@ -44,52 +49,43 @@ pub async fn validate_gossip_beacon_block(
     cached_db: &BeaconCacheDB,
     block: &SignedBeaconBlock,
 ) -> anyhow::Result<DependencyValidationResult<GossipValidatedBlock>> {
-    let parent = {
-        let store = beacon_chain.store.lock().await;
+    let db = beacon_chain.db();
 
-        if block.message.slot > store.get_current_slot()? {
-            return Ok(DependencyValidationResult::Ignore(
-                "Block is from a future slot".to_string(),
-            ));
-        }
+    if block.message.slot > get_current_slot_from_db(db)? {
+        return Ok(DependencyValidationResult::Ignore(
+            "Block is from a future slot".to_string(),
+        ));
+    }
 
-        let finalized_checkpoint = store.db.finalized_checkpoint_provider().get()?;
-        if block.message.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
-            return Ok(DependencyValidationResult::Ignore(
-                "Block is not from a slot greater than the latest finalized slot".to_string(),
-            ));
-        }
+    let finalized_checkpoint = db.finalized_checkpoint_provider().get()?;
+    if block.message.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
+        return Ok(DependencyValidationResult::Ignore(
+            "Block is not from a slot greater than the latest finalized slot".to_string(),
+        ));
+    }
 
-        if let Some(parent_block) = store.db.block_provider().get(block.message.parent_root)? {
-            let Some(parent_state) = store.db.state_provider().get(block.message.parent_root)?
-            else {
+    // Database reads do not need the store lock; `find_parent` takes it briefly, and only when the
+    // parent is not imported, to consult the pending-availability set.
+    let parent = match find_parent(beacon_chain, block.message.parent_root).await? {
+        Some(ParentBlock::Imported { block, state }) => {
+            let Some(parent_state) = state else {
                 return Err(anyhow!(
                     "failed to get state for known parent block {}",
                     block.message.parent_root
                 ));
             };
             Some(ParentContext {
-                block: parent_block,
+                block,
                 state: parent_state,
                 pending_availability: false,
             })
-        } else if let Some(pending) = store
-            .data_availability_checker
-            .pending_block(&block.message.parent_root)
-        {
-            if pending.signed_block.message.tree_hash_root() != block.message.parent_root {
-                return Err(anyhow!(
-                    "pending availability block root does not match lookup key"
-                ));
-            }
-            Some(ParentContext {
-                block: pending.signed_block.clone(),
-                state: pending.post_state.clone(),
-                pending_availability: true,
-            })
-        } else {
-            None
         }
+        Some(ParentBlock::PendingAvailability { block, state }) => Some(ParentContext {
+            block,
+            state,
+            pending_availability: true,
+        }),
+        None => None,
     };
 
     let Some(parent) = parent else {
@@ -126,17 +122,17 @@ async fn validate_beacon_block(
     state: &BeaconState,
     parent: &ParentContext,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
+    let db = beacon_chain.db();
 
     // [IGNORE] The block is not from a future slot.
-    if block.message.slot > store.get_current_slot()? {
+    if block.message.slot > get_current_slot_from_db(db)? {
         return Ok(ValidationResult::Ignore(
             "Block is from a future slot".to_string(),
         ));
     }
 
     // [IGNORE] The block is from a slot greater than the latest finalized slot.
-    let finalized_checkpoint = store.db.finalized_checkpoint_provider().get()?;
+    let finalized_checkpoint = db.finalized_checkpoint_provider().get()?;
     if block.message.slot <= compute_start_slot_at_epoch(finalized_checkpoint.epoch) {
         return Ok(ValidationResult::Ignore(
             "Block is not from a slot greater than the latest finalized slot".to_string(),
@@ -185,7 +181,7 @@ async fn validate_beacon_block(
 
     #[cfg(not(feature = "disable_ancestor_validation"))]
     if !parent.pending_availability
-        && store.get_checkpoint_block(block.message.parent_root, finalized_checkpoint.epoch)?
+        && get_checkpoint_block_from_db(db, block.message.parent_root, finalized_checkpoint.epoch)?
             != finalized_checkpoint.root
     {
         return Ok(ValidationResult::Reject(
@@ -197,8 +193,6 @@ async fn validate_beacon_block(
     // can only check that the child is newer than finality and points to that exact pending block.
     // Finality can advance while it waits; release repeats the normal walk after parent import.
 
-    // State advancement and cache access do not require exclusive access to the store.
-    drop(store);
     let mut state = state.clone();
     if let Err(err) = state.process_slots(block.message.slot) {
         return Ok(ValidationResult::Ignore(format!(

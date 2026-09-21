@@ -8,9 +8,10 @@ use ream_consensus_misc::{
     constants::beacon::{DOMAIN_BEACON_ATTESTER, SLOTS_PER_EPOCH},
     misc::{compute_epoch_at_slot, compute_signing_root},
 };
+use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_storage::{
     cache::{AtestationKey, BeaconCacheDB},
-    tables::{field::REDBField, table::REDBTable},
+    tables::table::REDBTable,
 };
 use ream_validator_beacon::attestation::compute_subnet_for_attestation;
 
@@ -28,10 +29,11 @@ pub async fn validate_beacon_attestation(
     attestation_subnet_id: u64,
     cached_db: &BeaconCacheDB,
 ) -> anyhow::Result<ValidationResult> {
-    let store = beacon_chain.store.lock().await;
-
-    let head_root = store.get_head()?;
-    let current_slot = store.get_current_slot()?;
+    // A cheap read of the published head; everything below runs off-lock. Block lookups go
+    // straight to the database, which serves readers without the store lock.
+    let head = beacon_chain.head()?;
+    let db = beacon_chain.db();
+    let current_slot = head.current_slot;
 
     // [IGNORE] attestation.data.slot is equal to or earlier than the current_slot (with a
     // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)
@@ -41,28 +43,22 @@ pub async fn validate_beacon_attestation(
         ));
     }
 
-    let head_slot = store
-        .db
-        .block_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon block found for head root: {head_root}"))?
-        .message
-        .slot;
-    if is_too_far_behind_to_validate(head_slot, attestation.data.slot) {
+    if is_too_far_behind_to_validate(head.head_slot, attestation.data.slot) {
         return Ok(ValidationResult::Ignore(
             "Local chain is syncing and too far behind to validate attestation".to_string(),
         ));
     }
 
-    let mut state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
-
-    if state.slot < attestation.data.slot {
-        state.process_slots(attestation.data.slot)?;
-    }
+    // Only clone the state when it has to be advanced to the attestation's slot.
+    let advanced_state: BeaconState;
+    let state: &BeaconState = if head.state.slot < attestation.data.slot {
+        let mut advanced = BeaconState::clone(&head.state);
+        advanced.process_slots(attestation.data.slot)?;
+        advanced_state = advanced;
+        &advanced_state
+    } else {
+        &head.state
+    };
 
     let committee_index = attestation.committee_index;
     let committees_per_slot = state.get_committee_count_per_slot(attestation.data.target.epoch);
@@ -160,8 +156,7 @@ pub async fn validate_beacon_attestation(
     // [IGNORE] The block being voted for (aggregate.data.beacon_block_root) has been seen (via
     // gossip or non-gossip sources) (a client MAY queue aggregates for processing once block is
     // retrieved).
-    if store
-        .db
+    if db
         .block_provider()
         .get(attestation.data.beacon_block_root)?
         .is_none()
@@ -175,7 +170,8 @@ pub async fn validate_beacon_attestation(
     // All blocks stored passed validation
 
     // [REJECT] The attestation's target block is an ancestor of the block named in the LMD vote
-    if store.get_checkpoint_block(
+    if get_checkpoint_block_from_db(
+        db,
         attestation.data.beacon_block_root,
         attestation.data.target.epoch,
     )? != attestation.data.target.root
@@ -187,8 +183,9 @@ pub async fn validate_beacon_attestation(
 
     // [IGNORE] The current finalized_checkpoint is an ancestor of the block defined by
     // aggregate.data.beacon_block_root
-    let finalized_checpoint = store.db.finalized_checkpoint_provider().get()?;
-    if store.get_checkpoint_block(
+    let finalized_checpoint = head.finalized_checkpoint;
+    if get_checkpoint_block_from_db(
+        db,
         attestation.data.beacon_block_root,
         finalized_checpoint.epoch,
     )? != finalized_checpoint.root
