@@ -153,7 +153,7 @@ pub async fn validate_aggregate_and_proof(
     // slot i.e., is_aggregator(state, aggregate.data.slot, index,
     // aggregate_and_proof.selection_proof) returns True
     let is_valid_aggregator = is_aggregator(
-        &state,
+        state,
         attestation_slot,
         committee_index,
         aggregate_and_proof.selection_proof.clone(),

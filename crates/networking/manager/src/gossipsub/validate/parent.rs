@@ -33,7 +33,7 @@ pub async fn find_parent(
     parent_root: B256,
 ) -> anyhow::Result<Option<ParentBlock>> {
     // The importer writes a block and its state in separate transactions, so without the store lock
-    // a block can be visible before its state. 
+    // a block can be visible before its state.
     if let Some(parent @ ParentBlock::Imported { state: Some(_), .. }) =
         load_imported_parent(beacon_chain.db(), parent_root)?
     {
