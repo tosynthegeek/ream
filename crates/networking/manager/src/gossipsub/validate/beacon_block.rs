@@ -2,11 +2,13 @@ use anyhow::anyhow;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState};
 use ream_consensus_misc::{
-    constants::beacon::MAX_BLOBS_PER_BLOCK_ELECTRA, misc::compute_start_slot_at_epoch,
+    blob_parameters::{BlobParameters, get_blob_parameters},
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
 };
 #[cfg(not(feature = "disable_ancestor_validation"))]
 use ream_fork_choice_beacon::store::get_checkpoint_block_from_db;
 use ream_fork_choice_beacon::store::get_current_slot_from_db;
+use ream_network_spec::networks::beacon_network_spec;
 use ream_storage::{
     cache::{AddressSlotIdentifier, BeaconCacheDB},
     tables::field::REDBField,
@@ -254,7 +256,7 @@ async fn validate_beacon_block(
     }
 
     // [REJECT] The length of KZG commitments is less than or equal to the limitation.
-    if block.message.body.blob_kzg_commitments.len() > MAX_BLOBS_PER_BLOCK_ELECTRA as usize {
+    if !blob_commitment_count_is_valid(block, &beacon_network_spec().blob_schedule) {
         return Ok(ValidationResult::Reject(
             "Length of KZG commitments is greater than the limit".to_string(),
         ));
@@ -288,4 +290,60 @@ async fn validate_beacon_block(
     }
 
     Ok(ValidationResult::Accept)
+}
+
+fn blob_commitment_count_is_valid(block: &SignedBeaconBlock, schedule: &[BlobParameters]) -> bool {
+    block.message.body.blob_kzg_commitments.len()
+        <= get_blob_parameters(schedule, compute_epoch_at_slot(block.message.slot))
+            .max_blobs_per_block as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use ream_consensus_misc::{
+        constants::beacon::SLOTS_PER_EPOCH, polynomial_commitments::kzg_commitment::KZGCommitment,
+    };
+
+    use super::*;
+
+    #[test]
+    fn gossip_blob_limit_follows_block_epoch_schedule() {
+        let schedule = vec![
+            BlobParameters {
+                epoch: 0,
+                max_blobs_per_block: 15,
+            },
+            BlobParameters {
+                epoch: 2,
+                max_blobs_per_block: 21,
+            },
+        ];
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        for (epoch, count, expected) in [
+            (0, 10, true),
+            (0, 15, true),
+            (0, 16, false),
+            (1, 21, false),
+            (2, 21, true),
+            (2, 22, false),
+        ] {
+            block.message.slot = epoch * SLOTS_PER_EPOCH;
+            block.message.body.blob_kzg_commitments =
+                vec![KZGCommitment::empty_for_testing(); count]
+                    .try_into()
+                    .expect("test commitments fit the SSZ bound");
+            assert_eq!(
+                blob_commitment_count_is_valid(&block, &schedule),
+                expected,
+                "epoch {epoch}, commitments {count}"
+            );
+        }
+        block.message.body.blob_kzg_commitments = vec![KZGCommitment::empty_for_testing(); 10]
+            .try_into()
+            .expect("test commitments fit the SSZ bound");
+        assert!(!blob_commitment_count_is_valid(&block, &[]));
+    }
 }
