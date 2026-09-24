@@ -6209,6 +6209,7 @@ dependencies = [
 name = "ream"
 version = "0.1.0"
 dependencies = [
+ "actix-web",
  "alloy-primitives",
  "anyhow",
  "bip39",

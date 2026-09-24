@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use actix_web::{
     HttpResponse, Responder, get,
     web::{Data, Path, Query},
@@ -8,6 +10,7 @@ use ream_api_types_beacon::{
     responses::{BeaconResponse, BeaconVersionedResponse, RootResponse},
 };
 use ream_api_types_common::{error::ApiError, id::ID};
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::electra::beacon_state::BeaconState;
 use ream_consensus_misc::{
     checkpoint::Checkpoint, constants::beacon::SYNC_COMMITTEE_SIZE,
@@ -131,10 +134,21 @@ pub async fn get_state_fork(
 /// Called by `/states/<state_id>/finality_checkpoints` to get the Checkpoint Data of state.
 #[get("/beacon/states/{state_id}/finality_checkpoints")]
 pub async fn get_state_finality_checkpoint(
+    beacon_chain: Data<Arc<BeaconChain>>,
     db: Data<BeaconDB>,
     state_id: Path<ID>,
 ) -> Result<impl Responder, ApiError> {
-    let state = get_state_from_id(state_id.into_inner(), &db).await?;
+    let state_id = state_id.into_inner();
+    let state = if matches!(state_id, ID::Head) {
+        beacon_chain
+            .head()
+            .map_err(|err| {
+                ApiError::InternalError(format!("Failed to get head snapshot: {err:?}"))
+            })?
+            .state
+    } else {
+        Arc::new(get_state_from_id(state_id, &db).await?)
+    };
 
     Ok(
         HttpResponse::Ok().json(BeaconResponse::new(CheckpointData::new(

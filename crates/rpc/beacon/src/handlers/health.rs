@@ -7,9 +7,8 @@ use actix_web::{
 };
 use ream_api_types_beacon::query::HealthQuery;
 use ream_api_types_common::error::ApiError;
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_execution_engine::ExecutionEngine;
-use ream_operation_pool::OperationPool;
-use ream_storage::db::beacon::BeaconDB;
 
 use super::syncing::calculate_sync_status;
 
@@ -19,8 +18,7 @@ use super::syncing::calculate_sync_status;
 /// - `syncing_status`: Optional custom HTTP status code to use when syncing (instead of 206)
 #[get("/node/health")]
 pub async fn get_health(
-    db: Data<BeaconDB>,
-    operation_pool: Data<Arc<OperationPool>>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     execution_engine: Data<Option<ExecutionEngine>>,
     query: Query<HealthQuery>,
 ) -> Result<impl Responder, ApiError> {
@@ -33,7 +31,7 @@ pub async fn get_health(
         )));
     }
 
-    let sync_status = calculate_sync_status(&db, &operation_pool, &execution_engine).await?;
+    let sync_status = calculate_sync_status(&beacon_chain, &execution_engine).await?;
 
     if sync_status.is_syncing || sync_status.is_optimistic || sync_status.el_offline {
         let status_code: StatusCode = query

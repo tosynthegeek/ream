@@ -1690,3 +1690,94 @@ async fn test_rpc_column_fetch_rechecks_finality_before_import() {
         "a column rejected at release must not enter served storage"
     );
 }
+
+#[actix_web::test]
+#[serial]
+async fn test_head_apis_ignore_partially_imported_block() {
+    use actix_web::{App, http::StatusCode, test, web::Data};
+    use ream_rpc_beacon::handlers::{
+        header::get_headers_from_block, state::get_state_finality_checkpoint,
+        syncing::get_syncing_status,
+    };
+
+    let (harness, _, _) = GossipLookupHarness::new("head_api_partial_import").await;
+    let head = harness.beacon_chain.head().expect("published anchor");
+    let db = harness.beacon_chain.db().clone();
+    // Block insertion publishes slot/parent indexes before the post-state is available.
+    // The harness also has a higher, noncanonical state at slot 64.
+    let block = SignedBeaconBlock {
+        message: BeaconBlock {
+            slot: 65,
+            parent_root: head.head_root,
+            ..Default::default()
+        },
+        signature: Default::default(),
+    };
+    let partial_root = block.message.tree_hash_root();
+    db.block_provider()
+        .insert(partial_root, block)
+        .expect("partial block");
+    assert!(db.state_provider().get(partial_root).unwrap().is_none());
+
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(db))
+            .app_data(Data::new(harness.beacon_chain.clone()))
+            .app_data(Data::new(harness.beacon_chain.operation_pool().clone()))
+            .app_data(Data::new(Option::<ExecutionEngine>::None))
+            .service(get_syncing_status)
+            .service(get_headers_from_block)
+            .service(get_state_finality_checkpoint),
+    )
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/node/syncing").to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["data"]["head_slot"], head.head_slot.to_string());
+    assert_eq!(
+        body["data"]["sync_distance"],
+        head.current_slot.saturating_sub(head.head_slot).to_string()
+    );
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/beacon/headers/head")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["data"]["root"], format!("{}", head.head_root));
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/beacon/states/head/finality_checkpoints")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(
+        body["data"]["current_justified"],
+        serde_json::to_value(head.state.current_justified_checkpoint).unwrap()
+    );
+    assert_eq!(
+        body["data"]["finalized"],
+        serde_json::to_value(head.state.finalized_checkpoint).unwrap()
+    );
+
+    for path in [
+        "/beacon/headers/99999",
+        "/beacon/states/99999/finality_checkpoints",
+    ] {
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}

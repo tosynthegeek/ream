@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use actix_web::{
     HttpResponse, Responder, get,
     web::{Data, Path, Query},
@@ -8,6 +10,7 @@ use ream_api_types_beacon::{
     responses::BeaconResponse,
 };
 use ream_api_types_common::{error::ApiError, id::ID};
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_misc::beacon_block_header::SignedBeaconBlockHeader;
 use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
 use serde::{Deserialize, Serialize};
@@ -83,10 +86,20 @@ pub async fn get_headers(
 /// Called using `/eth/v1/beacon/headers/{block_id}`
 #[get("/beacon/headers/{block_id}")]
 pub async fn get_headers_from_block(
+    beacon_chain: Data<Arc<BeaconChain>>,
     block_id: Path<ID>,
     db: Data<BeaconDB>,
 ) -> Result<impl Responder, ApiError> {
-    let block = get_beacon_block_from_id(block_id.into_inner(), &db).await?;
+    let block_id = block_id.into_inner();
+    let block_id = if matches!(block_id, ID::Head) {
+        let head = beacon_chain.head().map_err(|err| {
+            ApiError::InternalError(format!("Failed to get head snapshot: {err:?}"))
+        })?;
+        ID::Root(head.head_root)
+    } else {
+        block_id
+    };
+    let block = get_beacon_block_from_id(block_id, &db).await?;
     let header = block.signed_header();
 
     Ok(HttpResponse::Ok().json(BeaconResponse::new(HeaderData::new(
