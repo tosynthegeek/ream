@@ -4,7 +4,7 @@ use actix_web::{
     HttpResponse, Responder, get, post,
     web::{Data, Json, Path, Query},
 };
-use alloy_primitives::{Address, B256, U256, aliases::B32};
+use alloy_primitives::{Address, B256, aliases::B32};
 use ream_api_types_beacon::{
     block::{FullBlockData, ProduceBlockData, ProduceBlockResponse},
     committee::{BeaconCommitteeSubscription, SyncCommitteeSubscription},
@@ -54,19 +54,17 @@ use ream_events_beacon::{
     BeaconEvent, contribution_and_proof::SignedContributionAndProof,
     event::sync_committee::ContributionAndProofEvent,
 };
-use ream_execution_engine::{ExecutionEngine, engine_trait::ExecutionApi};
+use ream_execution_engine::ExecutionEngine;
 use ream_execution_rpc_types::{
     forkchoice_update::{ForkchoiceStateV1, PayloadAttributesV3},
     get_payload::Payload,
 };
 use ream_fork_choice_beacon::store::Store;
 use ream_network_manager::gossipsub::validate::sync_committee_contribution_and_proof::get_sync_subcommittee_pubkeys;
+use ream_network_manager::p2p_sender::P2PSender;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_operation_pool::OperationPool;
-use ream_p2p::{
-    gossipsub::beacon::topics::{GossipTopic, GossipTopicKind},
-    network::beacon::Network,
-};
+use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
 use ream_storage::{
     db::beacon::BeaconDB,
     tables::table::{CustomTable, REDBTable},
@@ -84,17 +82,14 @@ use ream_validator_beacon::{
         DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SYNC_COMMITTEE_SUBNET_COUNT,
     },
     execution_requests::get_execution_requests,
-    sync_committee::{
-        SyncAggregatorSelectionData, compute_subnets_for_sync_committee,
-        is_sync_committee_aggregator,
-    },
+    sync_committee::{SyncAggregatorSelectionData, is_sync_committee_aggregator},
 };
 use serde::Serialize;
 use ssz_types::{
     VariableList,
     typenum::{U1, U8, U16},
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tree_hash::TreeHash;
 
 use super::state::get_state_from_id;
@@ -811,7 +806,7 @@ impl SubscriptionAction {
 pub async fn post_beacon_committee_subscriptions(
     db: Data<BeaconDB>,
     subscriptions: Json<Vec<BeaconCommitteeSubscription>>,
-    network: Data<Mutex<Network>>,
+    network: Data<Arc<P2PSender>>,
 ) -> Result<impl Responder, ApiError> {
     let mut subnets: HashSet<(u64, B32)> = HashSet::new();
 
@@ -853,19 +848,16 @@ pub async fn post_beacon_committee_subscriptions(
         .map(|(subnet_id, fork)| SubscriptionAction::Subscribe { subnet_id, fork })
         .collect();
 
-    let mut network = network.lock().await;
-
     for action in actions {
         let topic = GossipTopic {
             fork: action.fork(),
             kind: GossipTopicKind::BeaconAttestation(action.subnet_id()),
         };
 
-        if !network.subscribe_to_topic(topic) {
-            return Err(ApiError::InternalError(
-                "Failed to subscribe to attestation subnet".to_string(),
-            ));
-        }
+        network
+            .subscribe(topic)
+            .await
+            .map_err(|err| ApiError::InternalError(err.to_string()))?;
     }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -873,11 +865,33 @@ pub async fn post_beacon_committee_subscriptions(
     })))
 }
 
+fn sync_subscription_subnets(
+    current_committee: &ream_consensus_beacon::sync_committee::SyncCommittee,
+    next_committee: &ream_consensus_beacon::sync_committee::SyncCommittee,
+    public_key: &PublicKey,
+    indices: &[u64],
+) -> Result<HashSet<u64>, ApiError> {
+    let mut subnets = HashSet::new();
+    for &index in indices {
+        let current = current_committee.public_keys.get(index as usize);
+        let next = next_committee.public_keys.get(index as usize);
+        if current != Some(public_key) && next != Some(public_key) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid sync committee position {index}"
+            )));
+        }
+        subnets.insert(
+            index / (current_committee.public_keys.len() as u64 / SYNC_COMMITTEE_SUBNET_COUNT),
+        );
+    }
+    Ok(subnets)
+}
+
 #[post("/validator/sync_committee_subscriptions")]
 pub async fn post_sync_committee_subscriptions(
     db: Data<BeaconDB>,
     subscriptions: Json<Vec<SyncCommitteeSubscription>>,
-    network: Data<Mutex<Network>>,
+    network: Data<Arc<P2PSender>>,
 ) -> Result<impl Responder, ApiError> {
     let subscriptions = subscriptions.into_inner();
 
@@ -925,26 +939,12 @@ pub async fn post_sync_committee_subscriptions(
             )));
         }
 
-        // Compute which subnets this validator needs to subscribe to
-        let validator_subnets = compute_subnets_for_sync_committee(
-            &state,
-            subscription.validator_index,
-        )
-        .map_err(|err| {
-            ApiError::InternalError(format!("Failed to compute sync committee subnets: {err}"))
-        })?;
-
-        // Validate that the provided sync_committee_indices match the computed subnets
-        let provided_indices: HashSet<u64> = subscription
-            .sync_committee_indices
-            .iter()
-            .copied()
-            .collect();
-        if provided_indices != validator_subnets {
-            return Err(ApiError::BadRequest(format!(
-                "Provided sync_committee_indices {provided_indices:?} do not match computed subnets {validator_subnets:?}",
-            )));
-        }
+        let validator_subnets = sync_subscription_subnets(
+            &state.current_sync_committee,
+            &state.next_sync_committee,
+            &validator.public_key,
+            &subscription.sync_committee_indices,
+        )?;
 
         let fork = gossip_fork_digest(&state);
         for subnet_id in validator_subnets {
@@ -953,18 +953,16 @@ pub async fn post_sync_committee_subscriptions(
     }
 
     // Subscribe to all required subnets
-    let mut network = network.lock().await;
     for (subnet_id, fork) in subnets_to_subscribe {
         let topic = GossipTopic {
             fork,
             kind: GossipTopicKind::SyncCommittee(subnet_id),
         };
 
-        if !network.subscribe_to_topic(topic) {
-            return Err(ApiError::InternalError(format!(
-                "Failed to subscribe to sync committee subnet {subnet_id}",
-            )));
-        }
+        network
+            .subscribe(topic)
+            .await
+            .map_err(|err| ApiError::InternalError(err.to_string()))?;
     }
 
     Ok(HttpResponse::Ok().body(""))
@@ -1355,7 +1353,7 @@ async fn get_local_execution_payload(
         .await
         .map_err(|err| ApiError::InternalError(format!("Failed to get payload: {err}")))?;
 
-    let execution_value: u64 = U256::from_be_bytes(payload.block_value().0)
+    let execution_value: u64 = (*payload.block_value())
         .try_into()
         .map_err(|err| ApiError::InternalError(format!("Block value too large: {err}")))?;
 
@@ -1405,11 +1403,49 @@ async fn compare_builder_vs_local(
     }
 }
 
+fn validate_proposal_blob_bundle(
+    bundle: &ream_execution_rpc_types::get_payload::BlobsBundle,
+) -> Result<usize, ApiError> {
+    use ream_execution_rpc_types::get_payload::BlobsBundle;
+    let (blobs, commitments, proofs, proofs_per_blob) = match bundle {
+        BlobsBundle::V1(bundle) => (
+            bundle.blobs.len(),
+            bundle.commitments.len(),
+            bundle.proofs.len(),
+            1,
+        ),
+        BlobsBundle::V2(bundle) => (
+            bundle.blobs.len(),
+            bundle.commitments.len(),
+            bundle.proofs.len(),
+            ream_consensus_misc::constants::beacon::CELLS_PER_EXT_BLOB as usize,
+        ),
+    };
+    if blobs != commitments || proofs != commitments * proofs_per_blob {
+        return Err(ApiError::InternalError(
+            "Invalid execution payload blob bundle lengths".into(),
+        ));
+    }
+    Ok(proofs_per_blob)
+}
+
+fn execution_checkpoint_hash(db: &BeaconDB, root: B256) -> Result<B256, ApiError> {
+    if root == B256::ZERO {
+        return Ok(B256::ZERO);
+    }
+    db.block_provider()
+        .get(root)
+        .map_err(|err| ApiError::InternalError(format!("Failed to read checkpoint block: {err}")))?
+        .map(|block| block.message.body.execution_payload.block_hash)
+        .ok_or_else(|| ApiError::InternalError(format!("Missing checkpoint block {root}")))
+}
+
 #[get("/validator/blocks/{slot}")]
 pub async fn get_blocks_v3(
     path: Path<u64>,
     query: Query<BlockQuery>,
     db: Data<BeaconDB>,
+    beacon_chain: Data<Arc<ream_chain_beacon::beacon_chain::BeaconChain>>,
     operation_pool: Data<Arc<OperationPool>>,
     execution_engine: Data<Option<ExecutionEngine>>,
     builder_client: Data<Option<Arc<BuilderClient>>>,
@@ -1421,15 +1457,10 @@ pub async fn get_blocks_v3(
     let skip_randao_verification = query_params.skip_randao_verification.unwrap_or(false);
     let builder_boost_factor = query_params.builder_boost_factor.unwrap_or(100);
 
-    let store = Store::new(db.get_ref().clone(), operation_pool.get_ref().clone(), None);
-    let head_root = store
-        .get_head()
-        .map_err(|err| ApiError::InternalError(format!("Failed to get head root: {err:?}")))?;
-    let mut state = db
-        .state_provider()
-        .get(head_root)
-        .map_err(|err| ApiError::InternalError(format!("Failed to get state, error: {err:?}")))?
-        .ok_or_else(|| ApiError::NotFound(format!("Failed to find state for root {head_root}")))?;
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to read head: {err}")))?;
+    let mut state = (*head.state).clone();
 
     let current_slot = state.slot;
 
@@ -1440,9 +1471,11 @@ pub async fn get_blocks_v3(
     }
 
     // Process slots to get state at the requested slot.
-    state
-        .process_slots(slot)
-        .map_err(|err| ApiError::InternalError(format!("Failed to process slots: {err}")))?;
+    if slot > current_slot {
+        state
+            .process_slots(slot)
+            .map_err(|err| ApiError::InternalError(format!("Failed to process slots: {err}")))?;
+    }
 
     let proposer_index = state.get_beacon_proposer_index(Some(slot)).map_err(|err| {
         ApiError::InternalError(format!(
@@ -1476,8 +1509,8 @@ pub async fn get_blocks_v3(
 
     let forkchoice_state = ForkchoiceStateV1 {
         head_block_hash: state.latest_execution_payload_header.block_hash,
-        safe_block_hash: state.current_justified_checkpoint.root,
-        finalized_block_hash: state.finalized_checkpoint.root,
+        safe_block_hash: execution_checkpoint_hash(&db, head.justified_checkpoint.root)?,
+        finalized_block_hash: execution_checkpoint_hash(&db, head.finalized_checkpoint.root)?,
     };
 
     let payload_attribute = PayloadAttributesV3 {
@@ -1627,11 +1660,7 @@ pub async fn get_blocks_v3(
 
     let kzg_proofs: Vec<KZGProof> = local_payload.blobs_bundle().get_proofs();
 
-    if blob_kzg_commitments.len() != kzg_proofs.len() {
-        return Err(ApiError::InternalError(
-            "Mismatch between blob commitments and KZG proofs".into(),
-        ));
-    }
+    let proofs_per_blob = validate_proposal_blob_bundle(&local_payload.blobs_bundle())?;
 
     let execution_requests =
         get_execution_requests(local_payload.execution_requests().clone()).unwrap_or_default();
@@ -1668,46 +1697,40 @@ pub async fn get_blocks_v3(
         })?;
     block.state_root = post_state.tree_hash_root();
 
-    let blob_versioned_hashes: Vec<B256> = blob_kzg_commitments
-        .iter()
-        .map(|c| c.calculate_versioned_hash())
-        .collect();
-
-    let blobs_and_proofs = execution_engine
-        .clone()
-        .engine_get_blobs_v1(blob_versioned_hashes)
-        .await
-        .map_err(|err| {
-            ApiError::InternalError(format!(
-                "Failed to fetch blobs from execution engine: {err}"
-            ))
-        })?;
-
-    if blobs_and_proofs.len() != blob_kzg_commitments.len() {
+    let blobs = local_payload.blobs_bundle().get_blobs();
+    if blobs.len() != blob_kzg_commitments.len() {
         return Err(ApiError::InternalError(
-            "Blob count does not match commitments".to_string(),
+            "Blob count does not match commitments".into(),
         ));
     }
-
     let block_root = block.tree_hash_root();
     let blobs_and_proofs_provider = db.blobs_and_proofs_provider();
-    let mut blobs = Vec::with_capacity(blobs_and_proofs.len());
-    for (index, bap) in blobs_and_proofs.into_iter().enumerate() {
-        let blob_and_proof = bap.expect(
-            "Missing blob and proof from execution engine: expected BlobAndProofV1, got None",
-        );
-
-        // On failure, this block just won't have its data column sidecars broadcast later
-        // (`broadcast_data_column_sidecars` finds no cached blob and skips); the block itself is
-        // still proposed.
-        if let Err(err) = blobs_and_proofs_provider.insert(
-            BlobIdentifier::new(block_root, index as u64),
-            blob_and_proof.clone(),
-        ) {
-            tracing::error!("Failed to cache blob {index} for block {block_root:?}: {err}");
-        }
-
-        blobs.push(blob_and_proof.blob);
+    for (index, (blob, commitment)) in blobs.iter().zip(&blob_kzg_commitments).enumerate() {
+        let proof = if proofs_per_blob == 1 {
+            kzg_proofs[index]
+        } else {
+            let blob = blob.clone();
+            let commitment = commitment.clone();
+            tokio::task::spawn_blocking(move || {
+                ream_polynomial_commitments::handlers::compute_blob_kzg_proof(&blob, &commitment)
+            })
+            .await
+            .map_err(|err| ApiError::InternalError(format!("Blob proof worker failed: {err}")))?
+            .map_err(|err| {
+                ApiError::InternalError(format!("Failed to compute cached blob proof: {err}"))
+            })?
+        };
+        blobs_and_proofs_provider
+            .insert(
+                BlobIdentifier::new(block_root, index as u64),
+                ream_execution_rpc_types::get_blobs::BlobAndProofV1 {
+                    blob: blob.clone(),
+                    proof,
+                },
+            )
+            .map_err(|err| {
+                ApiError::InternalError(format!("Failed to cache proposal blob: {err}"))
+            })?;
     }
 
     let response = ProduceBlockResponse {
@@ -1755,4 +1778,108 @@ pub async fn get_aggregate_attestation(
     })?;
 
     Ok(HttpResponse::Ok().json(DataVersionedResponse::new(aggregated_attestation)))
+}
+
+#[cfg(test)]
+mod validator_api_tests {
+    use super::*;
+    use actix_web::{App, test};
+    use ream_execution_rpc_types::{
+        get_blobs::Blob,
+        get_payload::{BlobsBundle, BlobsBundleV1, BlobsBundleV2},
+    };
+    use ream_storage::db::ReamDB;
+
+    #[actix_web::test]
+    async fn subscription_route_extracts_registered_p2p_sender() {
+        let temp = tempdir::TempDir::new("subscription_rpc").unwrap();
+        let db = ReamDB::new(temp.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = test::init_service(
+            App::new()
+                .app_data(Data::new(db))
+                .app_data(Data::new(Arc::new(P2PSender(tx))))
+                .service(post_sync_committee_subscriptions),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/validator/sync_committee_subscriptions")
+                .set_json(serde_json::json!([]))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body = test::read_body(response).await;
+        assert!(String::from_utf8_lossy(&body).contains("Empty request body"));
+    }
+
+    #[test]
+    async fn checkpoint_uses_execution_hash_not_beacon_root() {
+        let temp = tempdir::TempDir::new("checkpoint_rpc").unwrap();
+        let db = ReamDB::new(temp.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let mut block = ream_consensus_beacon::electra::beacon_block::SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        let execution_hash = B256::repeat_byte(42);
+        block.message.body.execution_payload.block_hash = execution_hash;
+        let root = block.message.tree_hash_root();
+        assert_ne!(root, execution_hash);
+        db.block_provider().insert(root, block).unwrap();
+        assert_eq!(
+            execution_checkpoint_hash(&db, root).unwrap(),
+            execution_hash
+        );
+        assert_eq!(
+            execution_checkpoint_hash(&db, B256::ZERO).unwrap(),
+            B256::ZERO
+        );
+        assert!(execution_checkpoint_hash(&db, B256::repeat_byte(9)).is_err());
+    }
+
+    #[test]
+    async fn sync_positions_map_to_subnets_and_reject_out_of_range() {
+        let committee = ream_consensus_beacon::sync_committee::SyncCommittee {
+            public_keys: Default::default(),
+            aggregate_public_key: Default::default(),
+        };
+        let key = committee.public_keys[0].clone();
+        let subnets =
+            sync_subscription_subnets(&committee, &committee, &key, &[0, 127, 128, 511]).unwrap();
+        assert_eq!(subnets, HashSet::from([0, 1, 3]));
+        assert!(sync_subscription_subnets(&committee, &committee, &key, &[512]).is_err());
+        assert!(sync_subscription_subnets(&committee, &committee, &key, &[u64::MAX]).is_err());
+    }
+
+    #[test]
+    async fn fulu_bundle_requires_cell_proofs_and_one_blob_per_commitment() {
+        let mut bundle = BlobsBundleV2 {
+            blobs: vec![Blob::default()].try_into().unwrap(),
+            commitments: vec![KZGCommitment::empty_for_testing()].try_into().unwrap(),
+            proofs: vec![KZGProof::default(); 128].try_into().unwrap(),
+        };
+        assert_eq!(
+            validate_proposal_blob_bundle(&BlobsBundle::V2(bundle.clone())).unwrap(),
+            128
+        );
+        bundle.proofs = vec![KZGProof::default()].try_into().unwrap();
+        assert!(validate_proposal_blob_bundle(&BlobsBundle::V2(bundle)).is_err());
+        let bundle = BlobsBundleV1 {
+            blobs: vec![Blob::default()].try_into().unwrap(),
+            commitments: vec![KZGCommitment::empty_for_testing()].try_into().unwrap(),
+            proofs: vec![KZGProof::default()].try_into().unwrap(),
+        };
+        assert_eq!(
+            validate_proposal_blob_bundle(&BlobsBundle::V1(bundle)).unwrap(),
+            1
+        );
+    }
 }

@@ -174,6 +174,7 @@ pub async fn get_attester_duties(
                 public_key: validator.public_key.clone(),
                 validator_index,
                 committee_index,
+                committee_length: committee.len() as u64,
                 committees_at_slot,
                 validator_committee_index: validator_committee_index as u64,
                 slot,
@@ -335,6 +336,21 @@ mod tests {
     use tree_hash::TreeHash;
 
     use super::*;
+
+    #[test]
+    fn attester_duty_includes_quoted_committee_length() {
+        let duty = AttesterDuty {
+            public_key: Default::default(),
+            validator_index: 7,
+            committee_index: 0,
+            committee_length: 3,
+            committees_at_slot: 1,
+            validator_committee_index: 2,
+            slot: 5,
+        };
+        let json = serde_json::to_value(duty).unwrap();
+        assert_eq!(json["committee_length"], "3");
+    }
 
     fn test_db() -> (BeaconDB, TempDir) {
         let temp_dir = TempDir::new("ream_rpc_beacon_duties").expect("creates temp directory");

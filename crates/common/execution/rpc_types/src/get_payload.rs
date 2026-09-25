@@ -1,4 +1,4 @@
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::{Bytes, U256};
 use ream_consensus_misc::polynomial_commitments::{
     kzg_commitment::KZGCommitment, kzg_proof::KZGProof,
 };
@@ -25,7 +25,7 @@ pub struct BlobsBundleV1 {
 #[serde(rename_all = "camelCase")]
 pub struct PayloadV4 {
     pub execution_payload: ExecutionPayloadV3,
-    pub block_value: B256,
+    pub block_value: U256,
     pub blobs_bundle: BlobsBundleV1,
     pub should_override_builder: bool,
     pub execution_requests: Vec<Bytes>,
@@ -43,7 +43,7 @@ pub struct BlobsBundleV2 {
 #[serde(rename_all = "camelCase")]
 pub struct PayloadV5 {
     pub execution_payload: ExecutionPayloadV3,
-    pub block_value: B256,
+    pub block_value: U256,
     pub blobs_bundle: BlobsBundleV2,
     pub should_override_builder: bool,
     pub execution_requests: Vec<Bytes>,
@@ -110,7 +110,7 @@ impl Payload {
         }
     }
 
-    pub fn block_value(&self) -> &B256 {
+    pub fn block_value(&self) -> &U256 {
         match self {
             Payload::V4(payload) => &payload.block_value,
             Payload::V5(payload) => &payload.block_value,
@@ -147,6 +147,32 @@ impl Payload {
             .expect("converting a U16-bounded withdrawal list preserves its length"),
             blob_gas_used: ep.blob_gas_used,
             excess_blob_gas: ep.excess_blob_gas,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_payload_accepts_quantity_block_values() {
+        let payload = ExecutionPayloadV3::from(ExecutionPayload::default());
+        for value in ["0x0", "0x1234", "0x10000000000000000"] {
+            let json = serde_json::json!({
+                "executionPayload": payload,
+                "blockValue": value,
+                "blobsBundle": {"blobs": [], "commitments": [], "proofs": []},
+                "shouldOverrideBuilder": false,
+                "executionRequests": []
+            });
+            let v4: PayloadV4 = serde_json::from_value(json.clone()).unwrap();
+            let v5: PayloadV5 = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                v4.block_value,
+                U256::from_str_radix(&value[2..], 16).unwrap()
+            );
+            assert_eq!(v5.block_value, v4.block_value);
         }
     }
 }

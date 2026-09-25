@@ -7051,6 +7051,7 @@ dependencies = [
  "ream-operation-pool",
  "ream-p2p",
  "ream-peer",
+ "ream-polynomial-commitments",
  "ream-req-resp",
  "ream-rpc-common",
  "ream-storage",
