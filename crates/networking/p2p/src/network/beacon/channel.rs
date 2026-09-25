@@ -34,6 +34,10 @@ pub enum P2PCallbackError {
 }
 
 pub enum P2PMessage {
+    Subscribe {
+        topic: GossipTopic,
+        response: tokio::sync::oneshot::Sender<bool>,
+    },
     Request(P2PRequest),
     Response(P2PResponse),
     Gossip(GossipMessage),

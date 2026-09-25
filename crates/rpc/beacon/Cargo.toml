@@ -52,6 +52,7 @@ ream-network-spec.workspace = true
 ream-node.workspace = true
 ream-operation-pool.workspace = true
 ream-p2p.workspace = true
+ream-polynomial-commitments.workspace = true
 ream-peer.workspace = true
 ream-req-resp.workspace = true
 ream-rpc-common.workspace = true

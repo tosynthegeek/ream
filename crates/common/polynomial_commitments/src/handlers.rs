@@ -140,3 +140,29 @@ pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &DataColumnSidecar) -> any
         &sidecar.kzg_proofs,
     )
 }
+
+/// Build a blob proof for the legacy blob cache from a getPayload blob.
+pub fn compute_blob_kzg_proof(blob: &Blob, commitment: &KZGCommitment) -> anyhow::Result<KZGProof> {
+    kzg::eip_4844::compute_blob_kzg_proof_raw(
+        blob.to_fixed_bytes(),
+        commitment.0,
+        trusted_setup::blst_settings(),
+    )
+    .map(|proof| KZGProof::from(proof.to_bytes()))
+    .map_err(|err| anyhow!(err))
+}
+
+#[cfg(test)]
+mod proposal_proof_tests {
+    use super::*;
+
+    #[test]
+    fn cached_proof_verifies_against_the_payload_blob() {
+        let blob = Blob::default();
+        let mut commitment = [0u8; 48];
+        commitment[0] = 0xc0; // The zero polynomial commits to the point at infinity.
+        let commitment = KZGCommitment(commitment);
+        let proof = compute_blob_kzg_proof(&blob, &commitment).unwrap();
+        assert!(verify_blob_kzg_proof_batch(&[blob], &[commitment], &[proof]).unwrap());
+    }
+}

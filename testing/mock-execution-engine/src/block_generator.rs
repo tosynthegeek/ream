@@ -262,7 +262,7 @@ impl ExecutionBlockGenerator {
 
         Ok(PayloadV4 {
             execution_payload: ExecutionPayloadV3::from(payload),
-            block_value: B256::with_last_byte(1),
+            block_value: U256::from(1),
             blobs_bundle,
             should_override_builder: false,
             execution_requests: Vec::new(),
