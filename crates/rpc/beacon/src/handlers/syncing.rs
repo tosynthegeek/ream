@@ -6,39 +6,20 @@ use ream_api_types_beacon::{
     sync::SyncStatus,
 };
 use ream_api_types_common::error::ApiError;
+use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_execution_engine::ExecutionEngine;
-use ream_fork_choice_beacon::store::Store;
-use ream_operation_pool::OperationPool;
-use ream_storage::{db::beacon::BeaconDB, tables::table::REDBTable};
 use tracing::error;
 
 pub async fn calculate_sync_status(
-    db: &BeaconDB,
-    operation_pool: &Arc<OperationPool>,
+    beacon_chain: &BeaconChain,
     execution_engine: &Option<ExecutionEngine>,
 ) -> Result<SyncStatus, ApiError> {
-    let store = Store::new(db.clone(), operation_pool.clone(), None);
-
-    // get head_slot
-    let head = store.get_head().map_err(|err| {
-        ApiError::InternalError(format!("Failed to get current slot, error: {err:?}"))
-    })?;
-
-    let head_slot = match db.block_provider().get(head) {
-        Ok(Some(block)) => block.message.slot,
-        err => {
-            return Err(ApiError::InternalError(format!(
-                "Failed to get head slot, error: {err:?}"
-            )));
-        }
-    };
-
-    // calculate sync_distance
-    let current_slot = store.get_current_slot().map_err(|err| {
-        ApiError::InternalError(format!("Failed to get current slot, error: {err:?}"))
-    })?;
-
-    let sync_distance = current_slot.saturating_sub(head_slot);
+    // One published view keeps the head and clock coherent during block import.
+    let head = beacon_chain
+        .head()
+        .map_err(|err| ApiError::InternalError(format!("Failed to get head snapshot: {err:?}")))?;
+    let head_slot = head.head_slot;
+    let sync_distance = head.current_slot.saturating_sub(head_slot);
 
     // get el_offline
     let el_offline = match execution_engine {
@@ -64,11 +45,10 @@ pub async fn calculate_sync_status(
 /// Called by `eth/v1/node/syncing` to get the Node Version.
 #[get("/node/syncing")]
 pub async fn get_syncing_status(
-    db: Data<BeaconDB>,
-    operation_pool: Data<Arc<OperationPool>>,
+    beacon_chain: Data<Arc<BeaconChain>>,
     execution_engine: Data<Option<ExecutionEngine>>,
 ) -> Result<impl Responder, ApiError> {
-    let sync_status = calculate_sync_status(&db, &operation_pool, &execution_engine).await?;
+    let sync_status = calculate_sync_status(&beacon_chain, &execution_engine).await?;
 
     // `data` is the syncing status itself: wrapping it in another object makes every
     // spec-compliant consumer report the endpoint as unsupported and the node as offline.

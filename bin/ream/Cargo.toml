@@ -96,6 +96,7 @@ ream-validator-beacon.workspace = true
 ream-validator-lean.workspace = true
 
 [dev-dependencies]
+actix-web.workspace = true
 ream-bls.workspace = true
 ream-mock-execution-engine.workspace = true
 ream-req-resp.workspace = true
